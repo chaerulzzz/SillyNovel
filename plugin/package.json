@@ -1,0 +1,9 @@
+{
+  "name": "sillynovel-plugin",
+  "version": "0.0.1",
+  "description": "SillyNovel server plugin — project and chapter storage for the Writing Workspace",
+  "type": "module",
+  "main": "index.js",
+  "license": "AGPL-3.0-or-later",
+  "private": true
+}

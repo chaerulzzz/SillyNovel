@@ -12,6 +12,21 @@ out/
 .env.*
 !.env.example
 
+# SillyTavern runtime state — NEVER commit.
+# secrets.json holds API keys in PLAINTEXT; data/ holds users' private prose.
+# The default state dir is ~/.sillynovel (outside the repo); these patterns
+# catch it if anyone points SILLYNOVEL_STATE here or mounts in-tree.
+secrets.json
+data/
+config/config.yaml
+backups/
+.sillynovel/
+
+# Local-only working notes and agent instructions (not published)
+docs/
+AGENTS.md
+CLAUDE.md
+
 # Logs
 *.log
 npm-debug.log*

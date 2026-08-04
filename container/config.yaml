@@ -1,0 +1,37 @@
+# SillyNovel — SillyTavern configuration (local development)
+#
+# Mounted into the container at /home/node/app/config/config.yaml.
+# This is the LOCAL-ONLY profile used for Phases 1–6. Public exposure settings
+# (OAuth/SSO, LiteLLM, Funnel) are a separate concern — see docs/PLAN.md Phase 8.
+#
+# ⚠️ Phase 1 must verify this against the pinned SillyTavern version: unknown or
+# renamed keys are silently ignored, so confirm each setting actually took
+# effect rather than assuming it did.
+
+# --- Required for SillyNovel ---------------------------------------------
+# Loads plugins/sillynovel and mounts it at /api/plugins/sillynovel.
+enableServerPlugins: true
+enableServerPluginsAutoUpdate: false
+
+# Per-user data directories. Two accounts are needed to test isolation.
+enableUserAccounts: true
+
+# --- Networking -----------------------------------------------------------
+# `listen: true` is required for the host to reach the container at all.
+#
+# ⚠️ Expected first-run gotcha: the default whitelist (127.0.0.1, ::1) rejects
+# the container gateway address, so ST refuses connections even though it is
+# running. While loopback-only, disabling whitelist mode is acceptable; the
+# real boundary is that the port is published as 127.0.0.1:8000 (see run.sh).
+listen: true
+whitelistMode: false
+
+# Trusting X-Forwarded-For lets a client spoof 127.0.0.1. Off here, and it must
+# STAY off once a reverse proxy is introduced in Phase 8.
+enableForwardedWhitelist: false
+
+# --- Security defaults (correct as-is — do not flip these) ----------------
+allowKeysExposure: false
+securityOverride: false
+disableCsrfProtection: false
+enableCorsProxy: false

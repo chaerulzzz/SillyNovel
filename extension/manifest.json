@@ -1,0 +1,12 @@
+{
+  "display_name": "SillyNovel — Writing Workspace",
+  "version": "0.0.1",
+  "author": "chaerulzzz",
+  "homePage": "https://github.com/chaerulzzz/SillyNovel",
+  "js": "index.js",
+  "css": "style.css",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "auto_update": false
+}
