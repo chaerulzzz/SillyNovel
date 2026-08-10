@@ -32,14 +32,16 @@ Generated prose always appears as a **suggestion** — Insert, Replace, Copy, or
 ## Running
 
 ```bash
-# 1. Pin the SillyTavern image (sets IMAGE_TAG and IMAGE_DIGEST)
-#    run.sh refuses to start until a digest is set.
-$EDITOR container/run.sh
-
-# 2. Start it
+# Start the pinned SillyTavern release
 ./container/run.sh
 
-# 3. Open http://localhost:8000
+# Open http://localhost:8000
+```
+
+Apple Container is the default runtime. To use a Docker-compatible runtime:
+
+```bash
+CONTAINER_RUNTIME=docker ./container/run.sh
 ```
 
 Persistent SillyTavern state (config, user data, backups) lives in `~/.sillynovel` by default — **outside this repo**, because it contains user data and a `secrets.json` that stores API keys in plaintext. Override with `SILLYNOVEL_STATE`.
@@ -49,8 +51,9 @@ Persistent SillyTavern state (config, user data, backups) lives in `~/.sillynove
 | | |
 |---|---|
 | Image | `ghcr.io/sillytavern/sillytavern` |
-| Tag | _not yet pinned — Phase 1_ |
-| Digest | _not yet pinned — Phase 1_ |
+| Tag | `1.18.0` |
+| Multi-platform digest | `sha256:7b30a1698b605d01dbd01a20459600c035f0d2c866912b69d7eee98065dcedd3` |
+| Linux/arm64 manifest | `sha256:9ce71c3bff843597debf8a1911d6d7587adefb019a37e74572400c0741d2cdec` |
 
 Never run `:latest`. An upstream change can break an extension API or plugin assumption without warning; upgrades are a deliberate, tested step.
 

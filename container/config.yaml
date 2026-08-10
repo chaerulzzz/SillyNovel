@@ -19,12 +19,19 @@ enableUserAccounts: true
 # --- Networking -----------------------------------------------------------
 # `listen: true` is required for the host to reach the container at all.
 #
-# ⚠️ Expected first-run gotcha: the default whitelist (127.0.0.1, ::1) rejects
-# the container gateway address, so ST refuses connections even though it is
-# running. While loopback-only, disabling whitelist mode is acceptable; the
-# real boundary is that the port is published as 127.0.0.1:8000 (see run.sh).
+# Keep SillyTavern's access whitelist enabled. The container host/gateway is
+# admitted by whitelistDockerHosts, while run.sh also limits publication to
+# the host loopback interface.
 listen: true
-whitelistMode: false
+whitelistMode: true
+whitelistDockerHosts: true
+
+# Reject unrecognized Host headers even though the published port is loopback
+# only. localhost and literal IP addresses are implicitly trusted by ST.
+hostWhitelist:
+  enabled: true
+  scan: true
+  hosts: []
 
 # Trusting X-Forwarded-For lets a client spoof 127.0.0.1. Off here, and it must
 # STAY off once a reverse proxy is introduced in Phase 8.
