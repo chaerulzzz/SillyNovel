@@ -4,7 +4,7 @@ A **Writing Workspace** for [SillyTavern](https://github.com/SillyTavern/SillyTa
 
 SillyNovel is **not a fork**. It is a UI extension plus a server plugin that mount into a stock, version-pinned SillyTavern container, so upstream updates stay free and this repository contains only its own code.
 
-> **Status: pre-implementation.** The repository scaffold exists; no features are built yet.
+> **Status: foundations complete, no writing features yet.** SillyTavern runs in a pinned, loopback-only container with the extension and plugin mounted, and an integration spike has verified per-user storage isolation, CSRF behaviour, atomic writes, and the generation APIs. The writing workspace itself is next.
 
 ## What it does
 
@@ -32,25 +32,58 @@ Generated prose always appears as a **suggestion** — Insert, Replace, Copy, or
 ## Running
 
 ```bash
-# 1. Pin the SillyTavern image (sets IMAGE_TAG and IMAGE_DIGEST)
-#    run.sh refuses to start until a digest is set.
-$EDITOR container/run.sh
-
-# 2. Start it
+# Start the pinned SillyTavern release
 ./container/run.sh
 
-# 3. Open http://localhost:8000
+# Open http://localhost:8000
+```
+
+Apple Container is the default runtime. To use a Docker-compatible runtime:
+
+```bash
+CONTAINER_RUNTIME=docker ./container/run.sh
 ```
 
 Persistent SillyTavern state (config, user data, backups) lives in `~/.sillynovel` by default — **outside this repo**, because it contains user data and a `secrets.json` that stores API keys in plaintext. Override with `SILLYNOVEL_STATE`.
+
+### First-run notes
+
+- **Storage requires `PUID`/`PGID`.** `run.sh` passes your host UID/GID as env
+  vars so SillyTavern's entrypoint remaps its process to write correctly into
+  the host-mounted `~/.sillynovel` directories. Without this, writes fail with
+  `EACCES`.
+- **The container gateway must be explicitly whitelisted.** `listen: true` is
+  required for the host to reach the container, but ST's connection whitelist
+  rejects the container's gateway IP by default — `whitelistDockerHosts`
+  doesn't cover Apple Container (it's gated on the `is-docker` package, which
+  returns false here). `run.sh` runs a gateway-drift preflight and fails
+  loudly, rather than starting an unreachable server, if the configured
+  whitelist doesn't match the live gateway (`container network inspect
+  default`).
+- **The deployed config is not auto-updated.** `run.sh` only copies
+  `container/config.yaml` into `~/.sillynovel/config/config.yaml` the first
+  time — once deployed, edit the deployed copy directly for config changes to
+  take effect (a plain `container stop`/`start` re-reads it; no image or env
+  change needed).
+- **Restarting**: use `container stop sillynovel` then `container start
+  sillynovel` — there is no `restart` subcommand, and `run.sh` intentionally
+  refuses to replace or start an existing container (its mounted state may
+  hold user prose or plaintext API keys).
+- **`skipContentCheck: true`** is set because Apple Container's virtiofs mount
+  doesn't support `chown`/`chmod` on host-mounted paths, which breaks ST's
+  bundled demo-content seeding (harmless — SillyNovel doesn't use ST's sample
+  characters/presets/themes). This skips that startup check entirely, not just
+  the one broken file; accepted as the right tradeoff for this pinned, minimal
+  deployment.
 
 ### Pinned SillyTavern version
 
 | | |
 |---|---|
 | Image | `ghcr.io/sillytavern/sillytavern` |
-| Tag | _not yet pinned — Phase 1_ |
-| Digest | _not yet pinned — Phase 1_ |
+| Tag | `1.18.0` |
+| Multi-platform digest | `sha256:7b30a1698b605d01dbd01a20459600c035f0d2c866912b69d7eee98065dcedd3` |
+| Linux/arm64 manifest | `sha256:9ce71c3bff843597debf8a1911d6d7587adefb019a37e74572400c0741d2cdec` |
 
 Never run `:latest`. An upstream change can break an extension API or plugin assumption without warning; upgrades are a deliberate, tested step.
 

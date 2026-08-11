@@ -19,12 +19,30 @@ enableUserAccounts: true
 # --- Networking -----------------------------------------------------------
 # `listen: true` is required for the host to reach the container at all.
 #
-# ⚠️ Expected first-run gotcha: the default whitelist (127.0.0.1, ::1) rejects
-# the container gateway address, so ST refuses connections even though it is
-# running. While loopback-only, disabling whitelist mode is acceptable; the
-# real boundary is that the port is published as 127.0.0.1:8000 (see run.sh).
+# Keep SillyTavern's access whitelist enabled. The container host/gateway is
+# admitted by whitelistDockerHosts, while run.sh also limits publication to
+# the host loopback interface.
 listen: true
-whitelistMode: false
+whitelistMode: true
+whitelistDockerHosts: true
+
+# Explicit gateway entry: whitelistDockerHosts above doesn't cover this. It's
+# gated on the `is-docker` npm package, which returns false under Apple
+# Container (this project's primary runtime) — so the gateway is never added
+# automatically no matter this setting. Confirmed via:
+#   container network inspect default   ->  status.ipv4Gateway
+# Exact IP, not the /24: other unrelated containers can share this subnet.
+whitelist:
+  - ::1
+  - 127.0.0.1
+  - 192.168.64.1
+
+# Reject unrecognized Host headers even though the published port is loopback
+# only. localhost and literal IP addresses are implicitly trusted by ST.
+hostWhitelist:
+  enabled: true
+  scan: true
+  hosts: []
 
 # Trusting X-Forwarded-For lets a client spoof 127.0.0.1. Off here, and it must
 # STAY off once a reverse proxy is introduced in Phase 8.
@@ -35,3 +53,14 @@ allowKeysExposure: false
 securityOverride: false
 disableCsrfProtection: false
 enableCorsProxy: false
+
+# Apple Container's virtiofs mount does not support chmod/chown on host-mounted
+# paths (confirmed: boot-time "chown: ... Operation not permitted" even for a
+# same-value chown). ST's bundled demo-content seeding relies on a chmod-
+# involving copy and fails with EACCES as a result, leaving 0-byte stub files
+# under every user's characters/ dir — cosmetic, not something SillyNovel uses.
+# skipContentCheck stops ST from attempting this seeding at all. Scope is
+# broader than just the broken file: it skips the startup check for ALL
+# bundled default content (presets, themes, backgrounds, lore, characters),
+# not only Seraphina. Accepted tradeoff for this pinned, minimal deployment.
+skipContentCheck: true

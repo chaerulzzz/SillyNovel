@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+#
+# ============================ DO NOT RUN =============================
+# Historical artifact from the Phase 1.5 integration spike. Kept as a
+# record of HOW things were verified, not as a runnable test.
+#
+# It cannot work, and would do damage if forced:
+#   * It targets /api/plugins/sillynovel/spike/* routes that were DELETED
+#     at the end of Phase 1.5. Every request would 404.
+#   * It stops and starts the real `sillynovel` container.
+#   * It runs `rm -rf` inside a live test user's data directory.
+#   * Its temp files are cleaned at the tail, not in the EXIT trap, so an
+#     early exit leaks them.
+#
+# The file is named *.sh.disabled deliberately: `bash file.sh` ignores the
+# executable bit, so removing that bit would not have been enough.
+#
+# For the reusable version, see ../SPEC.md — the same scenarios written
+# against the real storage routes Phase 2 builds.
+# =====================================================================
+# Phase 1.5 B-impl test harness, part 4: B2 HTTP contracts + hostile-id matrix.
+set -u
+
+BASE="http://127.0.0.1:8000"
+API="$BASE/api/plugins/sillynovel"
+
+COOKIE_DIR=$(mktemp -d)
+chmod 700 "$COOKIE_DIR"
+trap 'rm -rf "$COOKIE_DIR"' EXIT
+
+JAR_A="$COOKIE_DIR/a.jar"
+
+PASS=0
+FAIL=0
+declare -a FAILURES=()
+
+check() {
+  local desc="$1" cond="$2"
+  if [ "$cond" = "1" ]; then
+    PASS=$((PASS+1)); echo "PASS: $desc"
+  else
+    FAIL=$((FAIL+1)); FAILURES+=("$desc"); echo "FAIL: $desc"
+  fi
+}
+
+jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$1',''))" 2>/dev/null; }
+
+login() {
+  local jar="$1" handle="$2"
+  local csrf
+  csrf=$(curl -s -c "$jar" -b "$jar" "$BASE/csrf-token" | jget token)
+  curl -s -c "$jar" -b "$jar" -X POST "$BASE/api/users/login" \
+    -H "Content-Type: application/json" -H "X-CSRF-Token: $csrf" \
+    -d "{\"handle\":\"$handle\"}" > /dev/null
+  echo "$csrf"
+}
+
+req() {
+  local outfile="$1" method="$2" url="$3" jar="$4" csrf="$5" data="${6:-}"
+  if [ -n "$csrf" ] && [ -n "$data" ]; then
+    curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "X-CSRF-Token: $csrf" -H "Content-Type: application/json" -X "$method" "$url" -d "$data"
+  elif [ -n "$csrf" ]; then
+    curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "X-CSRF-Token: $csrf" -X "$method" "$url"
+  else
+    curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -X "$method" "$url"
+  fi
+}
+
+CSRF_A=$(login "$JAR_A" "sillynovel-test-a")
+R=$(mktemp)
+
+echo "== B2: HTTP contracts =="
+
+# Malformed body: non-string content
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" '{"content":12345}')
+check "non-string content -> 400 (code=$CODE)" "$([ "$CODE" = "400" ] && echo 1 || echo 0)"
+
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" '{}')
+check "missing content -> 400 (code=$CODE)" "$([ "$CODE" = "400" ] && echo 1 || echo 0)"
+
+# Byte cap: just under / just over 64 KiB, measured as UTF-8 bytes.
+UNDER=$(python3 -c "print('a' * 65500)")
+OVER=$(python3 -c "print('a' * 66000)")
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" "{\"content\":\"$UNDER\"}")
+check "just-under-cap accepted (code=$CODE)" "$([ "$CODE" = "201" ] && echo 1 || echo 0)"
+UNDER_ID=$(jget id < "$R")
+[ -n "$UNDER_ID" ] && req "$R" DELETE "$API/spike/files/$UNDER_ID" "$JAR_A" "$CSRF_A" > /dev/null
+
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" "{\"content\":\"$OVER\"}")
+check "just-over-cap rejected 413 (code=$CODE)" "$([ "$CODE" = "413" ] && echo 1 || echo 0)"
+
+# Multi-byte cap correctness: a string with character count under the cap
+# but byte count over it (each char is 3 bytes in UTF-8) must still 413.
+MULTIBYTE_OVER=$(python3 -c "print('日' * 25000)")  # 25000 chars * 3 bytes = 75000 bytes > 64KiB
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" "{\"content\":\"$MULTIBYTE_OVER\"}")
+check "multi-byte content capped on BYTES not chars (code=$CODE)" "$([ "$CODE" = "413" ] && echo 1 || echo 0)"
+
+# Round-trip fixture: unicode, embedded newlines, leading/trailing whitespace.
+FIXTURE=$(python3 -c "import json; print(json.dumps({'content': '  leading and trailing ws  \n embedded\nnewlines\n日本語 emoji 🎉 àccents  '}))")
+CODE=$(curl -s -o "$R" -w "%{http_code}" -b "$JAR_A" -H "X-CSRF-Token: $CSRF_A" -H "Content-Type: application/json" -X POST "$API/spike/files" -d "$FIXTURE")
+FIXTURE_ID=$(jget id < "$R")
+check "fixture create succeeds (code=$CODE)" "$([ "$CODE" = "201" ] && echo 1 || echo 0)"
+req "$R" GET "$API/spike/files/$FIXTURE_ID" "$JAR_A" "$CSRF_A" > /dev/null
+FIXTURE_READBACK=$(jget content < "$R")
+EXPECTED='  leading and trailing ws
+ embedded
+newlines
+日本語 emoji 🎉 àccents  '
+check "fixture round-trips byte-identical (whitespace/unicode/newlines preserved)" "$([ "$FIXTURE_READBACK" = "$EXPECTED" ] && echo 1 || echo 0)"
+[ -n "$FIXTURE_ID" ] && req "$R" DELETE "$API/spike/files/$FIXTURE_ID" "$JAR_A" "$CSRF_A" > /dev/null
+
+# Valid UUID, no such file
+FAKE_UUID="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+CODE=$(req "$R" GET "$API/spike/files/$FAKE_UUID" "$JAR_A" "$CSRF_A")
+check "valid-but-absent UUID GET -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+
+# Replace of a missing target must 404, never create.
+CODE=$(req "$R" POST "$API/spike/files/$FAKE_UUID" "$JAR_A" "$CSRF_A" '{"content":"should-not-be-created"}')
+check "replace of missing target -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CHECK_CREATED=$(container exec sillynovel sh -c "test -e /home/node/app/data/sillynovel-test-a/sillynovel-spike/$FAKE_UUID && echo yes || echo no")
+check "replace of missing target creates nothing" "$([ "$CHECK_CREATED" = "no" ] && echo 1 || echo 0)"
+
+echo
+echo "== B2: hostile-identifier matrix (7 cases) =="
+
+BEFORE_COUNT=$(container exec sillynovel sh -c "ls -a /home/node/app/data/sillynovel-test-a/sillynovel-spike/ | grep -vE '^\.\.?$' | wc -l" | tr -d ' ')
+
+check_hostile() {
+  local label="$1" encoded_id="$2"
+  local code
+  code=$(req "$R" GET "$API/spike/files/$encoded_id" "$JAR_A" "$CSRF_A")
+  local body
+  body=$(cat "$R")
+  local no_path
+  no_path=$(echo "$body" | grep -qi '/home/node\|/data/' && echo 0 || echo 1)
+  check "$label: rejected, no path (code=$code)" "$([ "$code" != "200" ] && [ "$no_path" = "1" ] && echo 1 || echo 0)"
+}
+
+check_hostile "encoded traversal" "..%2F..%2Fetc%2Fpasswd"
+check_hostile "absolute path" "%2Fetc%2Fpasswd"
+check_hostile "overlong segment" "$(python3 -c "print('a'*8192)")"
+check_hostile "encoded null byte" "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee%00.txt"
+check_hostile "wrong UUID version (v1-shaped)" "aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee"
+check_hostile "canonical UUID + trailing path" "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee%2F..%2F..%2Fsecrets.json"
+check_hostile "prefix confusion" "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-evil"
+
+# The one case Express may route entirely differently: a literal unencoded
+# slash creates a real path segment boundary, so it may 404 via no route
+# match rather than reach our handler at all. Either is fine per spec, as
+# long as no filesystem op occurred and nothing was disclosed.
+CODE_SLASH=$(req "$R" GET "$API/spike/files/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/../../secrets.json" "$JAR_A" "$CSRF_A")
+BODY_SLASH=$(cat "$R")
+check "literal-slash trailing path: 400 or 404, no path disclosed" "$( ( [ "$CODE_SLASH" = "400" ] || [ "$CODE_SLASH" = "404" ] ) && ! echo "$BODY_SLASH" | grep -qi '/home/node\|/data/' && echo 1 || echo 0 )"
+
+AFTER_COUNT=$(container exec sillynovel sh -c "ls -a /home/node/app/data/sillynovel-test-a/sillynovel-spike/ | grep -vE '^\.\.?$' | wc -l" | tr -d ' ')
+check "no filesystem entries created by any hostile-id case (before=$BEFORE_COUNT after=$AFTER_COUNT)" "$([ "$BEFORE_COUNT" = "$AFTER_COUNT" ] && echo 1 || echo 0)"
+
+echo
+echo "PASS=$PASS FAIL=$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  printf 'FAILED: %s\n' "${FAILURES[@]}"
+fi
+rm -f "$R"

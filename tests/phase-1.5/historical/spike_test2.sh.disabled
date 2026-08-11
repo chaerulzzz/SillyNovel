@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# ============================ DO NOT RUN =============================
+# Historical artifact from the Phase 1.5 integration spike. Kept as a
+# record of HOW things were verified, not as a runnable test.
+#
+# It cannot work, and would do damage if forced:
+#   * It targets /api/plugins/sillynovel/spike/* routes that were DELETED
+#     at the end of Phase 1.5. Every request would 404.
+#   * It stops and starts the real `sillynovel` container.
+#   * It runs `rm -rf` inside a live test user's data directory.
+#   * Its temp files are cleaned at the tail, not in the EXIT trap, so an
+#     early exit leaks them.
+#
+# The file is named *.sh.disabled deliberately: `bash file.sh` ignores the
+# executable bit, so removing that bit would not have been enough.
+#
+# For the reusable version, see ../SPEC.md — the same scenarios written
+# against the real storage routes Phase 2 builds.
+# =====================================================================
+# Phase 1.5 B-impl test harness, part 2: B1-B5 storage/atomic-write/symlink/isolation.
+set -u
+
+BASE="http://127.0.0.1:8000"
+API="$BASE/api/plugins/sillynovel"
+
+COOKIE_DIR=$(mktemp -d)
+chmod 700 "$COOKIE_DIR"
+trap 'rm -rf "$COOKIE_DIR"' EXIT
+
+JAR_A="$COOKIE_DIR/a.jar"
+JAR_B="$COOKIE_DIR/b.jar"
+
+PASS=0
+FAIL=0
+declare -a FAILURES=()
+
+check() {
+  local desc="$1" cond="$2"
+  if [ "$cond" = "1" ]; then
+    PASS=$((PASS+1)); echo "PASS: $desc"
+  else
+    FAIL=$((FAIL+1)); FAILURES+=("$desc"); echo "FAIL: $desc"
+  fi
+}
+
+jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$1',''))" 2>/dev/null; }
+
+login() {
+  local jar="$1" handle="$2"
+  local csrf
+  csrf=$(curl -s -c "$jar" -b "$jar" "$BASE/csrf-token" | jget token)
+  curl -s -c "$jar" -b "$jar" -X POST "$BASE/api/users/login" \
+    -H "Content-Type: application/json" -H "X-CSRF-Token: $csrf" \
+    -d "{\"handle\":\"$handle\"}" > /dev/null
+  echo "$csrf"
+}
+
+# Portable request helper: writes body to $1, prints HTTP code to stdout.
+req() {
+  local outfile="$1" method="$2" url="$3" jar="$4" csrf="$5" data="${6:-}"
+  if [ -n "$csrf" ]; then
+    if [ -n "$data" ]; then
+      curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "X-CSRF-Token: $csrf" -H "Content-Type: application/json" -X "$method" "$url" -d "$data"
+    else
+      curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "X-CSRF-Token: $csrf" -X "$method" "$url"
+    fi
+  else
+    if [ -n "$data" ]; then
+      curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "Content-Type: application/json" -X "$method" "$url" -d "$data"
+    else
+      curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -X "$method" "$url"
+    fi
+  fi
+}
+
+CSRF_A=$(login "$JAR_A" "sillynovel-test-a")
+CSRF_B=$(login "$JAR_B" "sillynovel-test-b")
+
+R=$(mktemp)
+
+echo "== B1/B3: atomic write proof =="
+
+# 1. Create -> read v1
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" '{"content":"VERSION-ONE-éè-content"}')
+ID=$(jget id < "$R")
+check "create returns 201 (code=$CODE)" "$([ "$CODE" = "201" ] && echo 1 || echo 0)"
+
+CODE=$(req "$R" GET "$API/spike/files/$ID" "$JAR_A" "$CSRF_A")
+V1_READ=$(jget content < "$R")
+check "read v1 byte-identical" "$([ "$V1_READ" = "VERSION-ONE-éè-content" ] && echo 1 || echo 0)"
+
+# 2. Replace -> read v2 (distinct from v1)
+CODE=$(req "$R" POST "$API/spike/files/$ID" "$JAR_A" "$CSRF_A" '{"content":"VERSION-TWO-different-content-entirely"}')
+check "replace returns 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+
+CODE=$(req "$R" GET "$API/spike/files/$ID" "$JAR_A" "$CSRF_A")
+V2_READ=$(jget content < "$R")
+check "read v2 is exactly v2, not v1 or a mix" "$([ "$V2_READ" = "VERSION-TWO-different-content-entirely" ] && echo 1 || echo 0)"
+
+# 3. Restart, read again
+container stop sillynovel > /dev/null 2>&1
+sleep 2
+container start sillynovel > /dev/null 2>&1
+sleep 5
+
+CSRF_A2=$(login "$JAR_A" "sillynovel-test-a")
+CODE=$(req "$R" GET "$API/spike/files/$ID" "$JAR_A" "$CSRF_A2")
+V2_AFTER_RESTART=$(jget content < "$R")
+check "still exactly v2 after stop/start" "$([ "$V2_AFTER_RESTART" = "VERSION-TWO-different-content-entirely" ] && echo 1 || echo 0)"
+
+# 4. No zero-byte stub, sane mode (host-side)
+FILEINFO=$(container exec sillynovel sh -c "stat -c '%s %a' /home/node/app/data/sillynovel-test-a/sillynovel-spike/$ID" 2>/dev/null)
+FILESIZE=$(echo "$FILEINFO" | awk '{print $1}')
+FILEMODE=$(echo "$FILEINFO" | awk '{print $2}')
+check "no zero-byte stub (size=$FILESIZE)" "$([ -n "$FILESIZE" ] && [ "$FILESIZE" -gt 0 ] && echo 1 || echo 0)"
+check "sane mode, not --w------- (mode=$FILEMODE)" "$([ "$FILEMODE" = "644" ] || [ "$FILEMODE" = "664" ] && echo 1 || echo 0)"
+
+HOST_CONTENT=$(cat "$HOME/.sillynovel/data/sillynovel-test-a/sillynovel-spike/$ID" 2>/dev/null)
+check "host-side content matches v2" "$([ "$HOST_CONTENT" = "VERSION-TWO-different-content-entirely" ] && echo 1 || echo 0)"
+
+echo
+echo "== B3: concurrent-read visibility during repeated replacement =="
+BAD_READS=0
+for i in $(seq 1 20); do
+  content="ROUND-$i-value"
+  curl -s -b "$JAR_A" -H "X-CSRF-Token: $CSRF_A2" -H "Content-Type: application/json" -X POST "$API/spike/files/$ID" -d "{\"content\":\"$content\"}" > /dev/null &
+  sleep 0.01
+  READBACK=$(curl -s -b "$JAR_A" "$API/spike/files/$ID" | jget content)
+  wait
+  if [ -n "$READBACK" ] && ! echo "$READBACK" | grep -qE '^(ROUND-[0-9]+-value|VERSION-TWO-different-content-entirely)$'; then
+    BAD_READS=$((BAD_READS+1))
+    echo "  suspicious read: '$READBACK'"
+  fi
+done
+check "no truncated/empty/mixed reads during concurrent replace ($BAD_READS bad of 20)" "$([ "$BAD_READS" = "0" ] && echo 1 || echo 0)"
+
+echo
+echo "== B3: controlled post-temp failure (rename target is a directory) =="
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A2" '{"content":"sentinel-for-directory-failure-test"}')
+FAIL_ID=$(jget id < "$R")
+# Remove the file, replace it with a non-empty directory at the same name.
+container exec sillynovel sh -c "rm -f /home/node/app/data/sillynovel-test-a/sillynovel-spike/$FAIL_ID && mkdir /home/node/app/data/sillynovel-test-a/sillynovel-spike/$FAIL_ID && echo x > /home/node/app/data/sillynovel-test-a/sillynovel-spike/$FAIL_ID/inner.txt"
+
+HOST_SPIKE_DIR="$HOME/.sillynovel/data/sillynovel-test-a/sillynovel-spike"
+LOG_MARKER="MARKER-$(date +%s%N)"
+container exec sillynovel sh -c "echo '$LOG_MARKER'" > /dev/null 2>&1
+
+CODE=$(req "$R" POST "$API/spike/files/$FAIL_ID" "$JAR_A" "$CSRF_A2" '{"content":"this-write-should-fail-post-temp"}')
+BODY=$(cat "$R")
+
+# Deterministic proof the temp file existed: EISDIR/ENOTEMPTY can ONLY come
+# from fs.rename() inside atomicWrite, which by construction only runs after
+# open('wx') -> write -> sync -> close all already succeeded. This is a
+# stronger guarantee than a timing-based poller (no false-negative risk from
+# a write completing faster than the poll interval).
+ERR_CODE=$(container logs sillynovel 2>&1 | grep "spike route error" | tail -1 | awk '{print $NF}')
+
+AFTER_TMP_COUNT=$(ls -a "$HOST_SPIKE_DIR" 2>/dev/null | grep -c '^\.tmp-' | tr -d ' ')
+SENTINEL_INTACT=$(container exec sillynovel sh -c "cat /home/node/app/data/sillynovel-test-a/sillynovel-spike/$FAIL_ID/inner.txt" 2>/dev/null)
+
+check "post-temp failure returns non-2xx (code=$CODE)" "$([ "$CODE" -ge 400 ] 2>/dev/null && echo 1 || echo 0)"
+check "response is sanitized (no path in body)" "$(echo "$BODY" | grep -qi '/home/node\|/data/' && echo 0 || echo 1)"
+check "failure is EISDIR/ENOTEMPTY from rename(), proving temp existed (err=$ERR_CODE)" "$(echo "$ERR_CODE" | grep -qE '^(EISDIR|ENOTEMPTY)$' && echo 1 || echo 0)"
+check "no orphan temp file left behind afterward (count=$AFTER_TMP_COUNT)" "$([ "$AFTER_TMP_COUNT" = "0" ] && echo 1 || echo 0)"
+check "sentinel/original unchanged" "$([ "$SENTINEL_INTACT" = "x" ] && echo 1 || echo 0)"
+
+# Plugin still usable after the failure?
+CODE=$(req "$R" GET "$API/spike/user-context" "$JAR_A" "$CSRF_A2")
+check "plugin still serves requests after failure (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+
+# cleanup the directory-shaped entry
+container exec sillynovel sh -c "rm -rf /home/node/app/data/sillynovel-test-a/sillynovel-spike/$FAIL_ID"
+
+echo
+echo "PASS=$PASS FAIL=$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  printf 'FAILED: %s\n' "${FAILURES[@]}"
+fi
+rm -f "$R"
+
+# Preserve $ID for the isolation test in part 3.
+# [sanitized] The original wrote to a machine-specific absolute scratch path.
+# A rewritten harness should pass this between parts explicitly (argument,
+# env var, or a path under a caller-provided working directory).
+echo "$ID"

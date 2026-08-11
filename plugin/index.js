@@ -4,8 +4,14 @@
  * Mounted by SillyTavern at /api/plugins/sillynovel (requires
  * `enableServerPlugins: true` in config.yaml).
  *
- * STATUS: scaffold. Only the Phase 1.5 spike routes exist — project/chapter
- * CRUD lands in Phase 4. See docs/PLAN.md.
+ * STATUS: scaffold. No storage routes exist yet — project/chapter CRUD lands
+ * in Phase 2. See docs/PLAN.md.
+ *
+ * The Phase 1.5 integration spike (server-generated UUIDs, atomic writes,
+ * cross-user isolation, CSRF/auth behavior, hostile-identifier rejection)
+ * was implemented, tested, and removed per docs/PLAN.md's "spike routes are
+ * production-shaped" — deletion is the only reliable guarantee a test
+ * endpoint never ships. Full results in docs/PROGRESS.md.
  *
  * ⚠️ SECURITY (see AGENTS.md — these are not negotiable):
  *  - NEVER reconstruct a user's filesystem path from a session handle. Use the
@@ -32,29 +38,6 @@ export async function init(router) {
     // Liveness check — confirms the plugin loaded and routes are mounted.
     router.get('/health', (_req, res) => {
         res.json({ ok: true, plugin: info.id, version: '0.0.1' });
-    });
-
-    /*
-     * Phase 1.5 storage spike.
-     *
-     * Reports whether ST's auth middleware populates `request.user.directories`
-     * on plugin routes. Per-user isolation depends entirely on this: if it is
-     * missing, the storage design changes — the path handling does not.
-     *
-     * Returns only booleans and key names, never absolute paths, so the probe
-     * itself cannot leak filesystem layout.
-     */
-    router.get('/spike/user-context', (req, res) => {
-        const user = req.user;
-        const directories = user?.directories;
-
-        res.json({
-            hasUser: Boolean(user),
-            hasDirectories: Boolean(directories),
-            directoryKeys: directories ? Object.keys(directories) : [],
-            // Blocker condition — see docs/PLAN.md Phase 1.5.
-            blocked: !directories,
-        });
     });
 
     console.log('[sillynovel] server plugin loaded (scaffold)');
