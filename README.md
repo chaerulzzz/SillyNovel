@@ -46,6 +46,36 @@ CONTAINER_RUNTIME=docker ./container/run.sh
 
 Persistent SillyTavern state (config, user data, backups) lives in `~/.sillynovel` by default — **outside this repo**, because it contains user data and a `secrets.json` that stores API keys in plaintext. Override with `SILLYNOVEL_STATE`.
 
+### First-run notes
+
+- **Storage requires `PUID`/`PGID`.** `run.sh` passes your host UID/GID as env
+  vars so SillyTavern's entrypoint remaps its process to write correctly into
+  the host-mounted `~/.sillynovel` directories. Without this, writes fail with
+  `EACCES`.
+- **The container gateway must be explicitly whitelisted.** `listen: true` is
+  required for the host to reach the container, but ST's connection whitelist
+  rejects the container's gateway IP by default — `whitelistDockerHosts`
+  doesn't cover Apple Container (it's gated on the `is-docker` package, which
+  returns false here). `run.sh` runs a gateway-drift preflight and fails
+  loudly, rather than starting an unreachable server, if the configured
+  whitelist doesn't match the live gateway (`container network inspect
+  default`).
+- **The deployed config is not auto-updated.** `run.sh` only copies
+  `container/config.yaml` into `~/.sillynovel/config/config.yaml` the first
+  time — once deployed, edit the deployed copy directly for config changes to
+  take effect (a plain `container stop`/`start` re-reads it; no image or env
+  change needed).
+- **Restarting**: use `container stop sillynovel` then `container start
+  sillynovel` — there is no `restart` subcommand, and `run.sh` intentionally
+  refuses to replace or start an existing container (its mounted state may
+  hold user prose or plaintext API keys).
+- **`skipContentCheck: true`** is set because Apple Container's virtiofs mount
+  doesn't support `chown`/`chmod` on host-mounted paths, which breaks ST's
+  bundled demo-content seeding (harmless — SillyNovel doesn't use ST's sample
+  characters/presets/themes). This skips that startup check entirely, not just
+  the one broken file; accepted as the right tradeoff for this pinned, minimal
+  deployment.
+
 ### Pinned SillyTavern version
 
 | | |

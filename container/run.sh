@@ -54,6 +54,32 @@ if [[ ! -e "$ST_STATE/config/config.yaml" ]]; then
   echo "Created initial config: $ST_STATE/config/config.yaml"
 fi
 
+# --- Gateway-drift preflight ----------------------------------------------
+# whitelist in the deployed config hardcodes this network's gateway IP (see
+# container/config.yaml). Apple Container's gateway isn't guaranteed to never
+# change, so fail loudly here instead of silently starting an unreachable
+# server. Docker-runtime deployments rely on whitelistDockerHosts instead, so
+# this check only applies to the Apple `container` runtime.
+if [[ "$CONTAINER_RUNTIME" == "container" ]]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for the gateway preflight check." >&2
+    exit 1
+  fi
+  ACTUAL_GATEWAY="$(container network inspect default 2>/dev/null | jq -r '.[0].status.ipv4Gateway // empty')"
+  if [[ -z "$ACTUAL_GATEWAY" ]]; then
+    echo "ERROR: Could not determine the Apple Container 'default' network gateway." >&2
+    echo "Run 'container network inspect default' manually to diagnose." >&2
+    exit 1
+  fi
+  if ! grep -qF "$ACTUAL_GATEWAY" "$ST_STATE/config/config.yaml"; then
+    echo "ERROR: Configured whitelist does not contain the current gateway IP." >&2
+    echo "  Deployed config: $ST_STATE/config/config.yaml" >&2
+    echo "  Actual gateway (container network inspect default): $ACTUAL_GATEWAY" >&2
+    echo "Update the 'whitelist:' entry in that file to match, then re-run." >&2
+    exit 1
+  fi
+fi
+
 APP_DIR="/home/node/app"
 
 # --- Run ------------------------------------------------------------------
@@ -71,6 +97,8 @@ exec "$CONTAINER_RUNTIME" run \
   --detach \
   --name "$CONTAINER_NAME" \
   --publish 127.0.0.1:8000:8000 \
+  --env "PUID=$(id -u)" \
+  --env "PGID=$(id -g)" \
   --volume "$ST_STATE/config:$APP_DIR/config" \
   --volume "$ST_STATE/data:$APP_DIR/data" \
   --volume "$ST_STATE/backups:$APP_DIR/backups" \
