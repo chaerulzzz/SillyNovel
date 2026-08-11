@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# ============================ DO NOT RUN =============================
+# Historical artifact from the Phase 1.5 integration spike. Kept as a
+# record of HOW things were verified, not as a runnable test.
+#
+# It cannot work, and would do damage if forced:
+#   * It targets /api/plugins/sillynovel/spike/* routes that were DELETED
+#     at the end of Phase 1.5. Every request would 404.
+#   * It stops and starts the real `sillynovel` container.
+#   * It runs `rm -rf` inside a live test user's data directory.
+#   * Its temp files are cleaned at the tail, not in the EXIT trap, so an
+#     early exit leaks them.
+#
+# The file is named *.sh.disabled deliberately: `bash file.sh` ignores the
+# executable bit, so removing that bit would not have been enough.
+#
+# For the reusable version, see ../SPEC.md — the same scenarios written
+# against the real storage routes Phase 2 builds.
+# =====================================================================
+# Phase 1.5 B-impl test harness. Reproducible procedure — see docs/PROGRESS.md.
+set -u
+
+BASE="http://127.0.0.1:8000"
+API="$BASE/api/plugins/sillynovel"
+
+COOKIE_DIR=$(mktemp -d)
+chmod 700 "$COOKIE_DIR"
+trap 'rm -rf "$COOKIE_DIR"' EXIT
+
+JAR_A="$COOKIE_DIR/a.jar"
+JAR_B="$COOKIE_DIR/b.jar"
+
+PASS=0
+FAIL=0
+declare -a FAILURES=()
+
+check() {
+  local desc="$1" cond="$2"
+  if [ "$cond" = "1" ]; then
+    PASS=$((PASS+1)); echo "PASS: $desc"
+  else
+    FAIL=$((FAIL+1)); FAILURES+=("$desc"); echo "FAIL: $desc"
+  fi
+}
+
+jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$1',''))" 2>/dev/null; }
+jhas() { python3 -c "import sys,json;d=json.load(sys.stdin);print(1 if '$1' in d else 0)" 2>/dev/null; }
+
+login() {
+  local jar="$1" handle="$2"
+  local csrf
+  csrf=$(curl -s -c "$jar" -b "$jar" "$BASE/csrf-token" | jget token)
+  curl -s -c "$jar" -b "$jar" -X POST "$BASE/api/users/login" \
+    -H "Content-Type: application/json" -H "X-CSRF-Token: $csrf" \
+    -d "{\"handle\":\"$handle\"}" > /dev/null
+  echo "$csrf"
+}
+
+echo "== setup =="
+CSRF_A=$(login "$JAR_A" "sillynovel-test-a")
+CSRF_B=$(login "$JAR_B" "sillynovel-test-b")
+# [sanitized] Removed an echo of the first 8 chars of each CSRF token. Session
+# tokens do not belong in terminal scrollback or CI logs, even truncated.
+
+echo
+echo "== B6: middleware gates =="
+
+CODE=$(curl -s -o /tmp/sn_r1.json -w "%{http_code}" "$API/spike/user-context")
+BODY=$(cat /tmp/sn_r1.json)
+UNSUCC=$([ "$CODE" -lt 200 -o "$CODE" -ge 300 ] 2>/dev/null && echo 1 || echo 0)
+NOBODY=$(echo "$BODY" | grep -q "hasDirectories" && echo 0 || echo 1)
+check "B6.1 unauth GET unsuccessful (code=$CODE)" "$UNSUCC"
+check "B6.1 unauth GET no probe body" "$NOBODY"
+
+RESP2=$(curl -s -b "$JAR_A" "$API/spike/user-context")
+check "B6.2 hasDirectories true" "$(echo "$RESP2" | python3 -c "import sys,json;print(1 if json.load(sys.stdin).get('hasDirectories') else 0)")"
+check "B6.2 root key present" "$(echo "$RESP2" | python3 -c "import sys,json;print(1 if 'root' in json.load(sys.stdin).get('directoryKeys',[]) else 0)")"
+check "B6.2 no absolute path leaked" "$(echo "$RESP2" | grep -qi '/home/node\|/data/' && echo 0 || echo 1)"
+
+RESP3=$(curl -s -w "\n%{http_code}" -b "$JAR_A" -H "X-CSRF-Token: $CSRF_A" -H "Content-Type: application/json" -X POST "$API/spike/files" -d '{"content":"gate-test-3"}')
+CODE3=$(echo "$RESP3" | tail -1)
+BODY3=$(echo "$RESP3" | head -n -1)
+check "B6.3 POST with CSRF succeeds (code=$CODE3)" "$([ "$CODE3" = "201" ] && echo 1 || echo 0)"
+ID3=$(echo "$BODY3" | jget id)
+curl -s -b "$JAR_A" -H "X-CSRF-Token: $CSRF_A" -X DELETE "$API/spike/files/$ID3" > /dev/null
+
+BEFORE_LS=$(container exec sillynovel sh -c "ls /home/node/app/data/sillynovel-test-a/sillynovel-spike 2>/dev/null | wc -l" | tr -d ' ')
+RESP4=$(curl -s -w "\n%{http_code}" -b "$JAR_A" -H "Content-Type: application/json" -X POST "$API/spike/files" -d '{"content":"gate-test-4-should-not-exist"}')
+CODE4=$(echo "$RESP4" | tail -1)
+AFTER_LS=$(container exec sillynovel sh -c "ls /home/node/app/data/sillynovel-test-a/sillynovel-spike 2>/dev/null | wc -l" | tr -d ' ')
+check "B6.4 POST without CSRF rejected (code=$CODE4)" "$([ "$CODE4" != "201" ] && echo 1 || echo 0)"
+check "B6.4 creates nothing (before=$BEFORE_LS after=$AFTER_LS)" "$([ "$BEFORE_LS" = "$AFTER_LS" ] && echo 1 || echo 0)"
+
+echo
+echo "== B6 harness: cross-session token, unauth write =="
+RESPX=$(curl -s -w "\n%{http_code}" -b "$JAR_B" -H "X-CSRF-Token: $CSRF_A" -H "Content-Type: application/json" -X POST "$API/spike/files" -d '{"content":"cross-session"}')
+CODEX=$(echo "$RESPX" | tail -1)
+check "A's token + B's session rejected (code=$CODEX)" "$([ "$CODEX" != "201" ] && echo 1 || echo 0)"
+
+BEFORE_LS_NOAUTH=$(container exec sillynovel sh -c "ls /home/node/app/data/sillynovel-test-a/sillynovel-spike 2>/dev/null | wc -l" | tr -d ' ')
+RESPU=$(curl -s -w "\n%{http_code}" -H "Content-Type: application/json" -X POST "$API/spike/files" -d '{"content":"unauth"}')
+CODEU=$(echo "$RESPU" | tail -1)
+AFTER_LS_NOAUTH=$(container exec sillynovel sh -c "ls /home/node/app/data/sillynovel-test-a/sillynovel-spike 2>/dev/null | wc -l" | tr -d ' ')
+check "unauthenticated write fails (code=$CODEU)" "$([ "$CODEU" != "201" ] && echo 1 || echo 0)"
+check "unauthenticated write creates nothing" "$([ "$BEFORE_LS_NOAUTH" = "$AFTER_LS_NOAUTH" ] && echo 1 || echo 0)"
+
+echo
+echo "PASS=$PASS FAIL=$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  printf 'FAILED: %s\n' "${FAILURES[@]}"
+fi

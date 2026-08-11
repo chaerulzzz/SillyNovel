@@ -4,7 +4,7 @@ A **Writing Workspace** for [SillyTavern](https://github.com/SillyTavern/SillyTa
 
 SillyNovel is **not a fork**. It is a UI extension plus a server plugin that mount into a stock, version-pinned SillyTavern container, so upstream updates stay free and this repository contains only its own code.
 
-> **Status: pre-implementation.** The repository scaffold exists; no features are built yet.
+> **Status: foundations complete, no writing features yet.** SillyTavern runs in a pinned, loopback-only container with the extension and plugin mounted, and an integration spike has verified per-user storage isolation, CSRF behaviour, atomic writes, and the generation APIs. The writing workspace itself is next.
 
 ## What it does
 

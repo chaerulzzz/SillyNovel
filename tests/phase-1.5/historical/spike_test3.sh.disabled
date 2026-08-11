@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# ============================ DO NOT RUN =============================
+# Historical artifact from the Phase 1.5 integration spike. Kept as a
+# record of HOW things were verified, not as a runnable test.
+#
+# It cannot work, and would do damage if forced:
+#   * It targets /api/plugins/sillynovel/spike/* routes that were DELETED
+#     at the end of Phase 1.5. Every request would 404.
+#   * It stops and starts the real `sillynovel` container.
+#   * It runs `rm -rf` inside a live test user's data directory.
+#   * Its temp files are cleaned at the tail, not in the EXIT trap, so an
+#     early exit leaks them.
+#
+# The file is named *.sh.disabled deliberately: `bash file.sh` ignores the
+# executable bit, so removing that bit would not have been enough.
+#
+# For the reusable version, see ../SPEC.md — the same scenarios written
+# against the real storage routes Phase 2 builds.
+# =====================================================================
+# Phase 1.5 B-impl test harness, part 3: B4 symlinks, B5 isolation sequence.
+set -u
+
+BASE="http://127.0.0.1:8000"
+API="$BASE/api/plugins/sillynovel"
+
+COOKIE_DIR=$(mktemp -d)
+chmod 700 "$COOKIE_DIR"
+trap 'rm -rf "$COOKIE_DIR"' EXIT
+
+JAR_A="$COOKIE_DIR/a.jar"
+JAR_B="$COOKIE_DIR/b.jar"
+
+PASS=0
+FAIL=0
+declare -a FAILURES=()
+
+check() {
+  local desc="$1" cond="$2"
+  if [ "$cond" = "1" ]; then
+    PASS=$((PASS+1)); echo "PASS: $desc"
+  else
+    FAIL=$((FAIL+1)); FAILURES+=("$desc"); echo "FAIL: $desc"
+  fi
+}
+
+jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$1',''))" 2>/dev/null; }
+
+login() {
+  local jar="$1" handle="$2"
+  local csrf
+  csrf=$(curl -s -c "$jar" -b "$jar" "$BASE/csrf-token" | jget token)
+  curl -s -c "$jar" -b "$jar" -X POST "$BASE/api/users/login" \
+    -H "Content-Type: application/json" -H "X-CSRF-Token: $csrf" \
+    -d "{\"handle\":\"$handle\"}" > /dev/null
+  echo "$csrf"
+}
+
+req() {
+  local outfile="$1" method="$2" url="$3" jar="$4" csrf="$5" data="${6:-}"
+  if [ -n "$csrf" ] && [ -n "$data" ]; then
+    curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "X-CSRF-Token: $csrf" -H "Content-Type: application/json" -X "$method" "$url" -d "$data"
+  elif [ -n "$csrf" ]; then
+    curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -H "X-CSRF-Token: $csrf" -X "$method" "$url"
+  else
+    curl -s -o "$outfile" -w "%{http_code}" -b "$jar" -X "$method" "$url"
+  fi
+}
+
+CSRF_A=$(login "$JAR_A" "sillynovel-test-a")
+CSRF_B=$(login "$JAR_B" "sillynovel-test-b")
+R=$(mktemp)
+
+HOST_ROOT_A="$HOME/.sillynovel/data/sillynovel-test-a"
+CONT_ROOT_A="/home/node/app/data/sillynovel-test-a"
+
+echo "== B4: symlink tests =="
+
+# Ensure a real spike dir exists first.
+req "$R" GET "$API/spike/user-context" "$JAR_A" "$CSRF_A" > /dev/null
+container exec sillynovel sh -c "mkdir -p $CONT_ROOT_A/sillynovel-spike" > /dev/null 2>&1
+
+# Sentinel setup: disposable sibling directory + a sentinel file inside it.
+container exec sillynovel sh -c "
+  rm -rf $CONT_ROOT_A/sillynovel-spike-sentinel
+  mkdir -p $CONT_ROOT_A/sillynovel-spike-sentinel
+  echo 'SENTINEL-CONTENT-UNCHANGED' > $CONT_ROOT_A/sillynovel-spike-sentinel/sentinel-file.txt
+"
+SENTINEL_BEFORE=$(cat "$HOST_ROOT_A/sillynovel-spike-sentinel/sentinel-file.txt")
+
+echo "--- test 1: directory swap ---"
+# Move the real spike dir aside, symlink sillynovel-spike -> the sentinel sibling.
+container exec sillynovel sh -c "
+  rm -rf $CONT_ROOT_A/sillynovel-spike.real
+  mv $CONT_ROOT_A/sillynovel-spike $CONT_ROOT_A/sillynovel-spike.real
+  ln -s $CONT_ROOT_A/sillynovel-spike-sentinel $CONT_ROOT_A/sillynovel-spike
+"
+
+CODE=$(req "$R" GET "$API/spike/user-context" "$JAR_A" "$CSRF_A")
+CODE_CREATE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" '{"content":"should-not-write-through-symlinked-dir"}')
+check "directory-swap: create rejected (code=$CODE_CREATE)" "$([ "$CODE_CREATE" -ge 400 ] 2>/dev/null && echo 1 || echo 0)"
+
+SENTINEL_AFTER_DIRSWAP=$(cat "$HOST_ROOT_A/sillynovel-spike-sentinel/sentinel-file.txt")
+check "directory-swap: sentinel untouched" "$([ "$SENTINEL_BEFORE" = "$SENTINEL_AFTER_DIRSWAP" ] && echo 1 || echo 0)"
+LEAKED_INTO_SENTINEL=$(container exec sillynovel sh -c "ls $CONT_ROOT_A/sillynovel-spike-sentinel/ | grep -vc sentinel-file.txt" | tr -d ' ')
+check "directory-swap: nothing new written into sentinel dir" "$([ "$LEAKED_INTO_SENTINEL" = "0" ] && echo 1 || echo 0)"
+
+# Restore the real spike directory.
+container exec sillynovel sh -c "
+  rm -f $CONT_ROOT_A/sillynovel-spike
+  mv $CONT_ROOT_A/sillynovel-spike.real $CONT_ROOT_A/sillynovel-spike
+"
+
+echo "--- test 2: leaf swap ---"
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" '{"content":"leaf-swap-target-original"}')
+LEAF_ID=$(jget id < "$R")
+
+# Replace the leaf with a symlink to the sentinel file.
+container exec sillynovel sh -c "
+  rm -f $CONT_ROOT_A/sillynovel-spike/$LEAF_ID
+  ln -s $CONT_ROOT_A/sillynovel-spike-sentinel/sentinel-file.txt $CONT_ROOT_A/sillynovel-spike/$LEAF_ID
+"
+
+CODE_GET=$(req "$R" GET "$API/spike/files/$LEAF_ID" "$JAR_A" "$CSRF_A")
+check "leaf-swap: GET rejected (code=$CODE_GET)" "$([ "$CODE_GET" = "404" ] && echo 1 || echo 0)"
+
+CODE_POST=$(req "$R" POST "$API/spike/files/$LEAF_ID" "$JAR_A" "$CSRF_A" '{"content":"attempted-overwrite-via-symlink"}')
+check "leaf-swap: replace rejected (code=$CODE_POST)" "$([ "$CODE_POST" = "404" ] && echo 1 || echo 0)"
+
+SENTINEL_AFTER_REPLACE_ATTEMPT=$(cat "$HOST_ROOT_A/sillynovel-spike-sentinel/sentinel-file.txt")
+check "leaf-swap: sentinel unchanged after replace attempt" "$([ "$SENTINEL_BEFORE" = "$SENTINEL_AFTER_REPLACE_ATTEMPT" ] && echo 1 || echo 0)"
+
+CODE_DEL=$(req "$R" DELETE "$API/spike/files/$LEAF_ID" "$JAR_A" "$CSRF_A")
+check "leaf-swap: delete rejected (code=$CODE_DEL)" "$([ "$CODE_DEL" = "404" ] && echo 1 || echo 0)"
+
+SENTINEL_AFTER_DELETE_ATTEMPT=$(cat "$HOST_ROOT_A/sillynovel-spike-sentinel/sentinel-file.txt")
+check "leaf-swap: sentinel unchanged after delete attempt" "$([ "$SENTINEL_BEFORE" = "$SENTINEL_AFTER_DELETE_ATTEMPT" ] && echo 1 || echo 0)"
+
+# Clean up the symlink leaf itself (not a real spike entry).
+container exec sillynovel sh -c "rm -f $CONT_ROOT_A/sillynovel-spike/$LEAF_ID"
+
+echo
+echo "== B5: isolation and persistence, exact sequence =="
+
+# 1. A creates, owns the file.
+CODE=$(req "$R" POST "$API/spike/files" "$JAR_A" "$CSRF_A" '{"content":"ISOLATION-V1"}')
+ISO_ID=$(jget id < "$R")
+check "1. A creates file (code=$CODE)" "$([ "$CODE" = "201" ] && echo 1 || echo 0)"
+
+# 2. A reads v1, replaces with v2.
+CODE=$(req "$R" GET "$API/spike/files/$ISO_ID" "$JAR_A" "$CSRF_A")
+V1=$(jget content < "$R")
+check "2. A reads v1" "$([ "$V1" = "ISOLATION-V1" ] && echo 1 || echo 0)"
+
+CODE=$(req "$R" POST "$API/spike/files/$ISO_ID" "$JAR_A" "$CSRF_A" '{"content":"ISOLATION-V2"}')
+check "2. A replaces with v2 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+
+# 3. B attempts GET, replace, DELETE with A's id.
+CODE_B_GET=$(req "$R" GET "$API/spike/files/$ISO_ID" "$JAR_B" "$CSRF_B")
+CODE_B_POST=$(req "$R" POST "$API/spike/files/$ISO_ID" "$JAR_B" "$CSRF_B" '{"content":"B-TRIES-TO-OVERWRITE"}')
+CODE_B_DEL=$(req "$R" DELETE "$API/spike/files/$ISO_ID" "$JAR_B" "$CSRF_B")
+
+# 4. All three return 404.
+check "3/4. B's GET on A's id -> 404 (code=$CODE_B_GET)" "$([ "$CODE_B_GET" = "404" ] && echo 1 || echo 0)"
+check "3/4. B's replace on A's id -> 404 (code=$CODE_B_POST)" "$([ "$CODE_B_POST" = "404" ] && echo 1 || echo 0)"
+check "3/4. B's delete on A's id -> 404 (code=$CODE_B_DEL)" "$([ "$CODE_B_DEL" = "404" ] && echo 1 || echo 0)"
+
+# 5. A re-reads: hash unchanged (still v2) -- proves B's attempts had no side effect.
+CODE=$(req "$R" GET "$API/spike/files/$ISO_ID" "$JAR_A" "$CSRF_A")
+V2_AFTER_B=$(jget content < "$R")
+check "5. A re-reads: still exactly v2, unaffected by B" "$([ "$V2_AFTER_B" = "ISOLATION-V2" ] && echo 1 || echo 0)"
+
+# 6. Restart, A re-reads: still v2.
+container stop sillynovel > /dev/null 2>&1; sleep 2; container start sillynovel > /dev/null 2>&1; sleep 5
+CSRF_A2=$(login "$JAR_A" "sillynovel-test-a")
+CODE=$(req "$R" GET "$API/spike/files/$ISO_ID" "$JAR_A" "$CSRF_A2")
+V2_AFTER_RESTART=$(jget content < "$R")
+check "6. after restart, A re-reads: still exactly v2" "$([ "$V2_AFTER_RESTART" = "ISOLATION-V2" ] && echo 1 || echo 0)"
+
+# 7. A deletes only now, after every isolation/persistence assertion is done.
+CODE=$(req "$R" DELETE "$API/spike/files/$ISO_ID" "$JAR_A" "$CSRF_A2")
+check "7. A deletes last (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+
+echo
+echo "PASS=$PASS FAIL=$FAIL"
+if [ "$FAIL" -gt 0 ]; then
+  printf 'FAILED: %s\n' "${FAILURES[@]}"
+fi
+rm -f "$R"
