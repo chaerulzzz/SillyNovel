@@ -1,4 +1,203 @@
 /*
  * SillyNovel — Writing Workspace styles
- * Scaffold only; the workspace UI lands in Phase 2 (docs/PLAN.md).
+ *
+ * Coexistence with SillyTavern's own layout (Phase 2, checkpoint 3).
+ *
+ * !important throughout the coexistence rules is deliberate. Three things
+ * compete for these properties, and none of them live in public/style.css:
+ *
+ *   1. css/mobile-styles.css:306,372 — !important below 1000px, at ID
+ *      specificity for five drawers and #character_popup.
+ *   2. css/mobile-styles.css:582+ — @supports(-webkit-touch-callout), which
+ *      is NOT width-gated and beats .drawer-content on source order.
+ *   3. Moving UI — RossAscends-mods.js:657 + power-user.js:1835 write and
+ *      PERSIST inline styles on #sheld/#WorldInfo/#left-nav-panel/etc.
+ *
+ * Against 1 both sides are important, so specificity decides and our
+ * `body.<class> #id` (1,1,1) beats their `#id` (1,0,0). Against 2 we win
+ * either way. Against 3 only !important works, since an inline style beats
+ * any normal rule — and ST's .css() never writes !important.
+ *
+ * --sheldWidth is deliberately NOT redefined. ST derives .fillLeft/.fillRight
+ * geometry, .zoomed_avatar, --leftGapWidth and .drawer-content.maximized from
+ * it, so changing it silently moves all of them — and .fillLeft's width
+ * formula GROWS as --sheldWidth shrinks. Every element we care about gets an
+ * explicit width instead.
  */
+
+:root {
+    --sillynovel-panel-width: 70vw;
+}
+
+body.sillynovel-panel-open.sillynovel-panel-maximized {
+    --sillynovel-panel-width: 100vw;
+}
+
+body.sillynovel-panel-open {
+    /* The strip the panel does not cover. Single source of truth, read by the
+       panel's own width and by every override below, so they cannot drift. */
+    --sillynovel-left-region: calc(100vw - var(--sillynovel-panel-width));
+}
+
+/* --- Chat column and its (empty) backdrop bar --------------------------- */
+
+body.sillynovel-panel-open #sheld,
+body.sillynovel-panel-open #top-bar {
+    left: 0 !important;
+    right: var(--sillynovel-panel-width) !important;
+    width: auto !important;
+    min-width: 0 !important;    /* #sheld's own floor is 100px */
+    margin: 0 !important;
+}
+
+/* #sheld only — Moving UI persists inline top/bottom/height as well, which
+   would otherwise leave the chat column floating mid-screen. */
+body.sillynovel-panel-open #sheld {
+    top: var(--topBarBlockSize) !important;
+    bottom: auto !important;
+    height: calc(100dvh - var(--topBarBlockSize) - 1px) !important;
+}
+
+/* --- Drawer icon row ---------------------------------------------------- */
+
+/* In normal flow, so `right` does nothing — shrink it and let the margin push
+   it flush left. position/width are forced because mobile-styles.css:288
+   makes this element fixed at 100vw below 1000px. */
+body.sillynovel-panel-open #top-settings-holder {
+    position: relative !important;
+    width: var(--sillynovel-left-region) !important;
+    margin-left: 0 !important;
+    margin-right: auto !important;
+}
+
+/* --- Drawers: policy rule ----------------------------------------------- */
+
+/* (0,2,1). Beats .drawer-content's base rule and the @supports block above.
+   Covers the six plain drawers — #rm_api_block, #AdvancedFormatting,
+   #user-settings-block, #Backgrounds, #rm_extensions_block,
+   #PersonaManagement — and #WorldInfo, which is position:fixed, so left:0
+   lands it against the viewport, which is the same box. */
+body.sillynovel-panel-open .drawer-content {
+    left: 0 !important;
+    right: auto !important;
+    width: var(--sillynovel-left-region) !important;
+    max-width: var(--sillynovel-left-region) !important;
+    min-width: 0 !important;    /* defeats .drawer-content's own 450px floor */
+    margin: 0 !important;
+}
+
+/* --- Surfaces ST names by ID with !important ---------------------------- */
+
+/* (1,1,1). The policy rule above is only (0,2,1) and loses to
+   mobile-styles.css:306/372's ID-level !important below 1000px. Enumerated
+   from those two selector lists, minus #movingDivs>div (not an ID).
+   #character_popup is here for a second reason: at z-index 4001 it sits BELOW
+   our 4050 panel, so it must live in the left region rather than rely on
+   stacking to be visible. */
+body.sillynovel-panel-open #left-nav-panel,
+body.sillynovel-panel-open #right-nav-panel,
+body.sillynovel-panel-open #floatingPrompt,
+body.sillynovel-panel-open #cfgConfig,
+body.sillynovel-panel-open #logprobsViewer,
+body.sillynovel-panel-open #character_popup {
+    left: 0 !important;
+    right: auto !important;
+    width: var(--sillynovel-left-region) !important;
+    max-width: var(--sillynovel-left-region) !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+}
+
+/* --- ST's own drawer-maximize state ------------------------------------- */
+
+/* ST: body:not(.movingUI) .drawer-content.maximized { width: var(--sheldWidth)
+   !important; margin: 0 auto !important; right: 0 !important } at (0,3,1).
+   Ours matches at (0,3,1) and loads later, so it wins. Without this, a
+   maximized ST drawer re-centres at --sheldWidth and lands under the panel. */
+body.sillynovel-panel-open .drawer-content.maximized {
+    left: 0 !important;
+    right: auto !important;
+    width: var(--sillynovel-left-region) !important;
+    max-width: var(--sillynovel-left-region) !important;
+    margin: 0 !important;
+}
+
+/* --- Maximized workspace ------------------------------------------------ */
+
+/* Both classes are required: the maximized class must never hide ST unless
+   the panel is actually open. #WorldInfo needs no entry — it is a DOM
+   descendant of #top-settings-holder, so display:none removes it too,
+   position:fixed notwithstanding. #character_popup is NOT a descendant of it,
+   so it is listed explicitly. */
+body.sillynovel-panel-open.sillynovel-panel-maximized #sheld,
+body.sillynovel-panel-open.sillynovel-panel-maximized #top-bar,
+body.sillynovel-panel-open.sillynovel-panel-maximized #top-settings-holder,
+body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
+    display: none !important;
+}
+
+/* --- The panel itself --------------------------------------------------- */
+
+/* z-index 4050: above ST's chrome ceiling (#top-settings-holder escalates to
+   4005 while a drawer is open, #movingDivs>div is 4000) and below
+   #shadow_select_chat_popup (4100) and every generic popup (9999+), so ST's
+   own modal surfaces stay usable over the workspace. */
+.sillynovel-panel {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: var(--sillynovel-panel-width);
+    z-index: 4050;
+    display: flex;
+    flex-direction: column;
+    background-color: var(--SmartThemeBlurTintColor);
+    border-left: 1px solid var(--SmartThemeBorderColor);
+    color: var(--SmartThemeBodyColor);
+    overflow: hidden;
+}
+
+.sillynovel-panel:focus {
+    outline: none;
+}
+
+.sillynovel-panel-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+}
+
+.sillynovel-panel-title {
+    flex: 1 1 auto;
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 1.05);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sillynovel-panel-header button {
+    flex: 0 0 auto;
+    background: none;
+    border: none;
+    padding: 6px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    color: inherit;
+    font-size: inherit;
+    line-height: 1;
+    opacity: 0.7;
+}
+
+.sillynovel-panel-header button:hover,
+.sillynovel-panel-header button:focus-visible {
+    opacity: 1;
+    background-color: var(--white20a);
+}
+
+.sillynovel-panel-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 12px;
+}
