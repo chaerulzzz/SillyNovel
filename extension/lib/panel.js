@@ -9,6 +9,8 @@
  *  - Use the stable context API via getContext(). Never import ST internals.
  */
 
+import { getSettings, resetWorkspace, resolveWorkspace } from './session.js';
+
 const EXTENSION_NAME = 'sillynovel-writing';
 
 /**
@@ -20,7 +22,6 @@ const EXTENSION_NAME = 'sillynovel-writing';
 const TEMPLATE_SCOPE = `third-party/${EXTENSION_NAME}`;
 const TEMPLATE_ID = 'templates/workspace';
 
-const SETTINGS_KEY = 'sillynovel';
 const PANEL_ID = 'sillynovel-panel';
 const BODY_OPEN_CLASS = 'sillynovel-panel-open';
 const BODY_MAXIMIZED_CLASS = 'sillynovel-panel-maximized';
@@ -43,23 +44,6 @@ let panelEl = null;
  * @type {Promise<HTMLElement|null>|null}
  */
 let openInFlight = null;
-
-/**
- * UI preferences only, per ARCHITECTURE.md §"extension_settings.sillynovel".
- * Never drafts, never profiles.
- *
- * @param {object} context result of SillyTavern.getContext()
- * @returns {object} the mutable settings bag for this extension
- */
-function getSettings(context) {
-    const all = context.extensionSettings;
-
-    if (!all[SETTINGS_KEY] || typeof all[SETTINGS_KEY] !== 'object') {
-        all[SETTINGS_KEY] = {};
-    }
-
-    return all[SETTINGS_KEY];
-}
 
 /**
  * Point the maximize control at whichever action is currently available.
@@ -172,6 +156,86 @@ function restoreFocus() {
 }
 
 /**
+ * Swap the body between its loading, ready and error states.
+ *
+ * Visibility is set here rather than trusted to the template's `hidden`
+ * attributes: that markup passes through DOMPurify on the way in.
+ *
+ * @param {HTMLElement} panel
+ * @param {'loading'|'ready'|'error'} state
+ */
+function setWorkspaceState(panel, state) {
+    const regions = {
+        loading: panel.querySelector('.sillynovel-workspace-loading'),
+        ready: panel.querySelector('.sillynovel-workspace-ready'),
+        error: panel.querySelector('.sillynovel-workspace-error'),
+    };
+
+    for (const [name, element] of Object.entries(regions)) {
+        if (element) {
+            element.hidden = name !== state;
+        }
+    }
+}
+
+/**
+ * Resolve which project and chapter are open, and show the result.
+ *
+ * Never throws: a failure here must leave the panel usable, showing why and
+ * offering a retry, rather than propagating into the caller that mounted it.
+ *
+ * @param {HTMLElement} panel
+ * @returns {Promise<void>}
+ */
+async function renderWorkspace(panel) {
+    setWorkspaceState(panel, 'loading');
+
+    try {
+        const workspace = await resolveWorkspace();
+
+        // The panel may have been closed while resolution was in flight.
+        if (!panel.isConnected) {
+            return;
+        }
+
+        const setText = (selector, text) => {
+            const element = panel.querySelector(selector);
+            if (element) {
+                element.textContent = text;
+            }
+        };
+
+        const characters = [...workspace.content].length;
+
+        setText('.sillynovel-project-title', workspace.project.title);
+        setText('.sillynovel-chapter-title', workspace.chapter.title);
+        setText('.sillynovel-chapter-stats', `${characters} character${characters === 1 ? '' : 's'}`);
+
+        setWorkspaceState(panel, 'ready');
+    } catch (error) {
+        console.error(`[${EXTENSION_NAME}] could not open the workspace`, error);
+
+        if (!panel.isConnected) {
+            return;
+        }
+
+        const message = panel.querySelector('.sillynovel-error-message');
+        if (message) {
+            // Plugin error bodies never contain a path (plugin/index.js), so
+            // these messages are safe to show as-is.
+            message.textContent = error?.message ?? 'SillyNovel could not open the workspace.';
+        }
+
+        const retry = panel.querySelector('.sillynovel-retry');
+        if (retry) {
+            retry.onclick = () => renderWorkspace(panel);
+        }
+
+        setWorkspaceState(panel, 'error');
+    }
+}
+
+/**
  * Render the template, then mount. The order is load-bearing: nothing touches
  * the DOM or the body classes until the render has resolved, so a template
  * that fails to resolve can never leave SillyTavern shrunk with no way back.
@@ -195,7 +259,7 @@ async function renderAndMount() {
     // Defensive: never end up with two panels if a stale node survived.
     document.getElementById(PANEL_ID)?.remove();
 
-    const isMaximized = getSettings(context).panelMaximized === true;
+    const isMaximized = getSettings().panelMaximized === true;
     const panel = buildPanel(bodyHtml, isMaximized);
 
     document.body.append(panel);
@@ -207,6 +271,12 @@ async function renderAndMount() {
     }
 
     panel.focus();
+
+    // Deliberately NOT awaited. Resolution must never gate the panel appearing:
+    // if it did, a slow or failed request would leave SillyTavern shrunk with no
+    // close control — the same failure the template guard above prevents,
+    // arriving by a different route.
+    renderWorkspace(panel);
 
     return panel;
 }
@@ -263,6 +333,10 @@ export function closePanel() {
     panelEl.remove();
     panelEl = null;
 
+    // Every open re-resolves against the server rather than trusting a snapshot
+    // taken before the panel was last closed.
+    resetWorkspace();
+
     restoreFocus();
 }
 
@@ -278,7 +352,7 @@ export function toggleMaximize() {
     const context = SillyTavern.getContext();
     const isMaximized = document.body.classList.toggle(BODY_MAXIMIZED_CLASS);
 
-    getSettings(context).panelMaximized = isMaximized;
+    getSettings().panelMaximized = isMaximized;
     context.saveSettingsDebounced();
 
     syncMaximizeButton(panelEl, isMaximized);

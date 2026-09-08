@@ -37,7 +37,15 @@ const EXTENSION_NAME = 'sillynovel-writing';
  * @returns {{required: object, semiPrivate: object, missing: string[]}}
  */
 function probeContextApis(context) {
-    const required = ['generateRaw', 'getTokenCountAsync', 'getTokenizerModel', 'stopGeneration'];
+    const required = [
+        'generateRaw',
+        'getTokenCountAsync',
+        'getTokenizerModel',
+        'stopGeneration',
+        // Load-bearing from checkpoint 4 on: every plugin write needs the
+        // CSRF token this returns, and AGENTS.md forbids hand-assembling it.
+        'getRequestHeaders',
+    ];
     const semiPrivate = ['getWorldInfoPrompt'];
 
     const check = (names) => Object.fromEntries(

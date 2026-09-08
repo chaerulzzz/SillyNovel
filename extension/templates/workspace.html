@@ -1,11 +1,25 @@
 <!--
-    SillyNovel — Writing Workspace placeholder body.
+    SillyNovel — Writing Workspace body.
 
-    Phase 2, checkpoint 3 builds the shell only. This markup exists so that a
-    successful render through renderExtensionTemplateAsync is visually
-    distinguishable from a silent path-resolution failure.
+    Phase 2, checkpoint 4: three states — loading, ready, error. There is no
+    editor here; the chapter's prose is loaded and held, but rendering it for
+    editing is checkpoint 5.
+
+    Visibility is driven from panel.js rather than trusted to these attributes:
+    this markup passes through DOMPurify on the way in.
 -->
-<div class="sillynovel-placeholder">
-    <h4>Writing Workspace</h4>
-    <p>Workspace shell — the chapter editor arrives in checkpoint 5.</p>
+<div class="sillynovel-workspace">
+    <p class="sillynovel-workspace-loading">Opening your workspace…</p>
+
+    <div class="sillynovel-workspace-ready" hidden>
+        <h4 class="sillynovel-project-title"></h4>
+        <p class="sillynovel-chapter-title"></p>
+        <p class="sillynovel-chapter-stats"></p>
+        <p class="sillynovel-workspace-note">The chapter editor arrives in checkpoint 5.</p>
+    </div>
+
+    <div class="sillynovel-workspace-error" hidden>
+        <p class="sillynovel-error-message"></p>
+        <button type="button" class="sillynovel-retry">Try again</button>
+    </div>
 </div>
