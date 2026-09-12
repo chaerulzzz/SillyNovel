@@ -74,6 +74,42 @@ let pendingChapterId = null;
 let openToken = 0;
 
 /**
+ * Bumped whenever `current` is replaced or discarded.
+ *
+ * ⚠️ A chapter id is identity, not a generation. After a close and reopen the
+ * SAME chapter id is open again, so an id-only guard would let a save issued
+ * before the close apply its etag and content to the reopened workspace. Saves
+ * capture this counter and check both.
+ */
+let workspaceGeneration = 0;
+
+/**
+ * In-flight saves, keyed by chapter id.
+ *
+ * Per chapter, never global: a global guard would stall the newly opened
+ * chapter's save behind the previous chapter's PUT after a fast switch.
+ *
+ * ⚠️ Deliberately NOT cleared by resetWorkspace(). A save for a reopened
+ * chapter must coalesce behind a still-running PUT for that same chapter rather
+ * than race it — the server's per-chapter lock would serialise the two and hand
+ * one of them a 412, a phantom conflict caused entirely by our own stale
+ * request.
+ * @type {Map<string, Promise<object|null>>}
+ */
+const saveInFlight = new Map();
+
+/**
+ * Which chapter has stopped autosaving, and why, or null.
+ *
+ * `conflict` is terminal until the chapter is switched away from, the workspace
+ * is reset, or the page reloads. `oversize` clears on the next edit, because
+ * editing is the only thing that can make the payload fit and retrying would
+ * otherwise re-send identical rejected bytes forever.
+ * @type {{chapterId: string, reason: 'conflict'|'oversize'}|null}
+ */
+let halted = null;
+
+/**
  * The extension's settings bag.
  *
  * Lives here rather than in panel.js because this module owns the persisted
@@ -166,6 +202,8 @@ async function resolve() {
         project.chapters = [...(Array.isArray(project.chapters) ? project.chapters : []), chapter];
     }
 
+    await settlePendingSave(chapter.id);
+
     const loaded = await api.getChapter(project.id, chapter.id);
 
     current = {
@@ -174,6 +212,10 @@ async function resolve() {
         content: loaded.content,
         etag: loaded.etag,
     };
+
+    // A new workspace object: anything captured against the previous one is stale.
+    workspaceGeneration += 1;
+    halted = null;
 
     // The listing is now the server's own, so nothing can still be missing from it.
     pendingChapterId = null;
@@ -222,6 +264,8 @@ export async function openChapter(chapterId, token = ++openToken) {
     const projectId = current.project.id;
     let loaded;
 
+    await settlePendingSave(chapterId);
+
     try {
         loaded = await api.getChapter(projectId, chapterId);
     } catch (error) {
@@ -243,6 +287,10 @@ export async function openChapter(chapterId, token = ++openToken) {
     current.chapter = { id: chapterId, title: entry?.title ?? 'Untitled chapter' };
     current.content = loaded.content;
     current.etag = loaded.etag;
+
+    // This read carries a fresh revision, so whatever halted saving on the way
+    // out no longer applies.
+    halted = null;
 
     remember(projectId, chapterId);
 
@@ -325,6 +373,156 @@ export function addChapter() {
     return addInFlight;
 }
 
+/**
+ * Wait for any in-flight save of this chapter before reading it.
+ *
+ * ⚠️ Reading a chapter whose PUT has not landed yet captures the PRE-WRITE
+ * revision. The write then lands, the server moves on, and the next save
+ * compares against a revision that is already stale — a 412 the author did
+ * nothing to deserve and cannot resolve, since nobody else actually edited
+ * anything. The close flush is fire-and-forget, so a close followed by a quick
+ * reopen hits this every time.
+ *
+ * The save's own outcome is irrelevant here: whether it succeeded or failed,
+ * the read that follows is what establishes the revision we go on to use.
+ *
+ * @param {string} chapterId
+ */
+async function settlePendingSave(chapterId) {
+    const running = saveInFlight.get(chapterId);
+
+    if (!running) {
+        return;
+    }
+
+    try {
+        await running;
+    } catch {
+        // Deliberately ignored — see above.
+    }
+}
+
+/**
+ * Is a captured save still speaking for the workspace that is open now?
+ *
+ * @param {number} generation
+ * @param {string} chapterId
+ */
+function isCurrentTarget(generation, chapterId) {
+    return current !== null
+        && generation === workspaceGeneration
+        && current.chapter.id === chapterId;
+}
+
+/**
+ * Why autosave has stopped for the open chapter, or null.
+ * @returns {'conflict'|'oversize'|null}
+ */
+export function getHalt() {
+    if (!halted || !current || halted.chapterId !== current.chapter.id) {
+        return null;
+    }
+
+    return halted.reason;
+}
+
+/**
+ * Clear an `oversize` halt. Called on edit: shortening the text is the only
+ * thing that can fix a 413, so the next keystroke is exactly when saving should
+ * resume. A `conflict` halt is NOT cleared here — it is terminal until the
+ * chapter is switched, reset, or reloaded.
+ */
+export function clearOversizeHalt() {
+    if (halted?.reason === 'oversize') {
+        halted = null;
+    }
+}
+
+/**
+ * @param {string} projectId
+ * @param {string} chapterId
+ * @param {number} generation
+ * @param {string} text
+ * @param {string} etag bare digest captured with the rest
+ */
+async function performSave(projectId, chapterId, generation, text, etag) {
+    let result;
+
+    try {
+        result = await api.putChapter(projectId, chapterId, text, etag);
+    } catch (error) {
+        // Stale: the workspace moved on while this was in flight. Swallow it —
+        // reporting a failure about a chapter the author already left is noise,
+        // and the next read of that chapter gets the server's truth anyway.
+        if (!isCurrentTarget(generation, chapterId)) {
+            return null;
+        }
+
+        if (error?.kind === api.ApiErrorKind.CONFLICT) {
+            halted = { chapterId, reason: 'conflict' };
+        } else if (error?.status === 413) {
+            halted = { chapterId, reason: 'oversize' };
+        }
+
+        throw error;
+    }
+
+    if (!isCurrentTarget(generation, chapterId)) {
+        return null;
+    }
+
+    // The bytes the server now holds, and the revision to compare against next
+    // time. Storing the returned etag is not optional: without it the next save
+    // compares against a revision the server has already moved past, and 412s
+    // against our own write.
+    current.content = text;
+    current.etag = result.etag;
+
+    return current;
+}
+
+/**
+ * Save the open chapter, as a compare-and-swap.
+ *
+ * Single-flight per chapter: a call arriving while a PUT is running returns
+ * THAT promise rather than starting a second one. It therefore does not save the
+ * newer text — the caller's settle step is what re-arms for that, which is why
+ * view.js re-checks dirtiness every time a save resolves.
+ *
+ * @param {string} text
+ * @returns {Promise<object|null>} the workspace, or null if the result was stale
+ */
+export function saveChapter(text) {
+    if (!current || getHalt() !== null) {
+        return Promise.resolve(null);
+    }
+
+    const chapterId = current.chapter.id;
+    const running = saveInFlight.get(chapterId);
+
+    if (running) {
+        return running;
+    }
+
+    const promise = performSave(
+        current.project.id,
+        chapterId,
+        workspaceGeneration,
+        text,
+        current.etag,
+    ).finally(() => {
+        // Only retire our own entry: a later save for this chapter may already
+        // have replaced it.
+        if (saveInFlight.get(chapterId) === promise) {
+            saveInFlight.delete(chapterId);
+        }
+    });
+
+    saveInFlight.set(chapterId, promise);
+
+    return promise;
+}
+
 /** @returns {object|null} the open workspace, without touching the network */
 export function getWorkspace() {
     return current;
@@ -347,4 +545,9 @@ export function resetWorkspace() {
     current = null;
     pendingChapterId = null;
     openToken += 1;
+
+    // Anything already in flight belongs to the workspace being torn down.
+    // saveInFlight is deliberately left alone — see its declaration.
+    workspaceGeneration += 1;
+    halted = null;
 }

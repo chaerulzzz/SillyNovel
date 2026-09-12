@@ -1,10 +1,10 @@
 <!--
     SillyNovel — Writing Workspace body.
 
-    Phase 2, checkpoint 5: the five regions the shell provides — chapter
+    Phase 2, checkpoints 5-6: the five regions the shell provides — chapter
     navigation, editor, save status, suggestion pane, and a Context Inspector
-    region. What fills them arrives later: the editor becomes writable in
-    checkpoint 6, the suggestion pane in 8, the Inspector in 9.
+    region. The editor saves as of checkpoint 6; the suggestion pane fills in 8
+    and the Inspector in 9.
 
     Region visibility is driven from view.js rather than trusted to these
     attributes: this markup passes through DOMPurify on the way in.
@@ -21,12 +21,8 @@
 
         <div class="sillynovel-editor-column">
             <h5 class="sillynovel-chapter-title"></h5>
-            <!--
-                Read-only until checkpoint 6 brings the save machine with it.
-                A textarea that accepts typing but cannot save is a way to lose
-                an author's work (hard rules 1 and 3).
-            -->
-            <textarea class="sillynovel-editor" readonly spellcheck="false"></textarea>
+            <!-- Writable as of checkpoint 6; autosave lives in view.js. -->
+            <textarea class="sillynovel-editor" spellcheck="false"></textarea>
             <p class="sillynovel-save-status" role="status"></p>
         </div>
 

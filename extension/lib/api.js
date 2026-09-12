@@ -30,6 +30,12 @@ export const ApiErrorKind = {
     UNAUTHENTICATED: 'unauthenticated',
     /** The plugin answered with an error code. */
     REQUEST: 'request',
+    /**
+     * 412: the chapter changed somewhere else since we read it. Distinct from
+     * REQUEST because PLAN.md requires a conflict WARNING rather than a generic
+     * failure — the author's unsaved words are at stake, not a retryable call.
+     */
+    CONFLICT: 'conflict',
     /** Could not reach the server at all. */
     NETWORK: 'network',
     /** The response did not satisfy something we require in order to proceed
@@ -92,11 +98,12 @@ async function readBody(response) {
  * @param {'GET'|'POST'|'PUT'} method
  * @param {string} path relative to PLUGIN_BASE
  * @param {object} [body]
+ * @param {object} [extraHeaders] merged over the CSRF/content-type defaults
  * @returns {Promise<any>} the parsed JSON body
  */
-async function request(method, path, body) {
+async function request(method, path, body, extraHeaders) {
     // Outside the try: a missing helper is a contract failure, not a network one.
-    const headers = requestHeaders();
+    const headers = { ...requestHeaders(), ...extraHeaders };
 
     let response;
 
@@ -128,6 +135,16 @@ async function request(method, path, body) {
             ApiErrorKind.BLOCKER,
             'SillyNovel could not reach your storage directory. This is a setup problem, not a temporary one — see the server log for the BLOCKER line.',
             { status: response.status, code: json.error ?? null },
+        );
+    }
+
+    // Ahead of the generic status handling: a stale revision is a distinct
+    // outcome the caller has to render differently, not an error to retry.
+    if (response.status === 412) {
+        throw new ApiError(
+            ApiErrorKind.CONFLICT,
+            'This chapter was changed somewhere else since you opened it.',
+            { status: 412, code: json?.error ?? null },
         );
     }
 
@@ -208,4 +225,33 @@ export async function createChapter(projectId, title) {
 export async function getChapter(projectId, chapterId) {
     const payload = await request('GET', `/projects/${projectId}/chapters/${chapterId}`);
     return { ...payload, etag: requireEtag(payload, 'a chapter') };
+}
+
+/**
+ * Replace a chapter's prose, as a compare-and-swap.
+ *
+ * ⚠️ THIS IS THE ONLY PLACE THE REVISION GETS QUOTED. State holds the bare
+ * digest (see requireEtag); parseIfMatch accepts only `"<64-hex>"` and answers
+ * 400 for an unquoted value, 428 for a missing one. Keeping the quoting here
+ * means exactly one function has to be right about it.
+ *
+ * The response carries {id, etag} and NO content — the new digest must replace
+ * the stored one, or the next save compares against a revision the server has
+ * already moved past and 412s against our own write.
+ *
+ * @param {string} projectId
+ * @param {string} chapterId
+ * @param {string} content
+ * @param {string} etag bare 64-hex digest
+ * @returns {Promise<{id: string, etag: string}>}
+ */
+export async function putChapter(projectId, chapterId, content, etag) {
+    const payload = await request(
+        'PUT',
+        `/projects/${projectId}/chapters/${chapterId}`,
+        { content },
+        { 'If-Match': `"${etag}"` },
+    );
+
+    return { ...payload, etag: requireEtag(payload, 'the saved chapter') };
 }

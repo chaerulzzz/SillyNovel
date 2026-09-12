@@ -10,7 +10,7 @@
  */
 
 import { getSettings, resetWorkspace } from './session.js';
-import { renderWorkspace } from './view.js';
+import { flushOnClose, renderWorkspace } from './view.js';
 
 const EXTENSION_NAME = 'sillynovel-writing';
 
@@ -244,6 +244,11 @@ export function closePanel() {
     if (!panelEl) {
         return;
     }
+
+    // Before anything is torn down, while session.js still has the open chapter:
+    // give unsaved text a chance to reach the server. Fire-and-forget by
+    // necessity — see flushOnClose().
+    flushOnClose();
 
     // Order matters: drop the body classes FIRST so ST's chrome — including
     // #sheld, which contains the wand button — is rendered again before

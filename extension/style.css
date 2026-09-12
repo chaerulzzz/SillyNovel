@@ -380,10 +380,6 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     line-height: 1.6;
 }
 
-.sillynovel-editor[readonly] {
-    opacity: 0.85;
-}
-
 .sillynovel-save-status {
     margin: 0;
     min-height: 1.4em;
@@ -498,4 +494,24 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-retry:hover,
 .sillynovel-retry:focus-visible {
     background-color: var(--white20a);
+}
+
+/* --- Save status emphasis (checkpoint 6) -------------------------------- */
+
+/* A conflict is the one status the author must actually read: their words are
+   unsaved and will not save until they act. Everything else is ambient. */
+.sillynovel-save-status[data-state="conflict"] {
+    opacity: 1;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 6px 8px;
+}
+
+.sillynovel-save-status[data-state="saving"],
+.sillynovel-save-status[data-state="dirty"] {
+    opacity: 0.85;
+}
+
+.sillynovel-editor[readonly] {
+    opacity: 0.85;
 }
