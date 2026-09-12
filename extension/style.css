@@ -198,30 +198,282 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 
 .sillynovel-panel-body {
     flex: 1 1 auto;
+    /* min-height:0 lets this flex child actually shrink, which is what allows
+       the grid inside it to give its own regions independent scrolling instead
+       of pushing the panel taller. */
+    min-height: 0;
     overflow-y: auto;
     padding: 12px;
 }
 
-/* --- Workspace body states (checkpoint 4) ------------------------------- */
+/* --- Workspace body (checkpoint 5) --------------------------------------
+ *
+ * Everything below is scoped inside .sillynovel-panel, so none of it meets the
+ * SillyTavern coexistence rules above and none of it needs !important — that
+ * mechanism stays confined to the rules that actually fight ST.
+ *
+ * Elements are styled explicitly rather than left to inherit: ST styles bare
+ * `button`, which is why the panel header buttons above carry their own reset.
+ * The same applies to the nav list and the editor.
+ */
+
+.sillynovel-workspace {
+    height: 100%;
+}
 
 .sillynovel-workspace-loading,
 .sillynovel-workspace-note {
     opacity: 0.7;
 }
 
+/* ⚠️ An author `display` beats the UA's [hidden] rule outright — cascade origin,
+   not specificity — so .sillynovel-workspace-ready's `display: grid` below would
+   otherwise keep the ready region on screen during the loading and error states.
+   This restores [hidden] inside the workspace at (0,2,0), which also wins over
+   the region rules' (0,1,0). Without it, view.js's setWorkspaceState() silently
+   does nothing visible. */
+.sillynovel-workspace [hidden] {
+    display: none;
+}
+
+/* Docked at 70vw the panel is ~900px on a 1280px viewport, so the columns are
+   sized to keep the editor readable there, not only when maximized. */
+.sillynovel-workspace-ready {
+    display: grid;
+    grid-template-columns: minmax(140px, 200px) minmax(0, 1fr) minmax(160px, 240px);
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+        "nav editor suggestions"
+        "inspector inspector inspector";
+    gap: 12px;
+    height: 100%;
+    min-height: 0;
+}
+
+/* Below ~1000px SillyTavern's own !important regime narrows everything and the
+   docked panel is only ~300px wide. Three columns cannot survive that, so the
+   regions stack instead of overflowing. */
+@media (max-width: 1000px) {
+    .sillynovel-workspace-ready {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            "nav"
+            "editor"
+            "suggestions"
+            "inspector";
+        grid-template-rows: auto minmax(160px, 1fr) auto auto;
+        overflow-y: auto;
+    }
+}
+
+/* --- nav rail --- */
+
+.sillynovel-nav {
+    grid-area: nav;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 8px;
+    border-right: 1px solid var(--SmartThemeBorderColor);
+}
+
+@media (max-width: 1000px) {
+    .sillynovel-nav {
+        border-right: none;
+        border-bottom: 1px solid var(--SmartThemeBorderColor);
+        padding-right: 0;
+        padding-bottom: 8px;
+    }
+}
+
 .sillynovel-project-title {
-    margin: 0 0 4px;
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 1.05);
+    overflow-wrap: anywhere;
+}
+
+.sillynovel-chapter-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sillynovel-chapter-entry,
+.sillynovel-new-chapter,
+.sillynovel-inspector-toggle,
+.sillynovel-inline-retry {
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 5px 8px;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    text-align: left;
+    cursor: pointer;
+    width: 100%;
+}
+
+.sillynovel-chapter-entry:hover,
+.sillynovel-new-chapter:hover,
+.sillynovel-inspector-toggle:hover,
+.sillynovel-chapter-entry:focus-visible,
+.sillynovel-new-chapter:focus-visible,
+.sillynovel-inspector-toggle:focus-visible {
+    background-color: var(--white20a);
+}
+
+.sillynovel-chapter-entry[aria-current="true"] {
+    border-color: var(--SmartThemeBorderColor);
+    font-weight: 600;
+}
+
+.sillynovel-busy {
+    opacity: 0.6;
+    cursor: progress;
+}
+
+.sillynovel-new-chapter {
+    border-color: var(--SmartThemeBorderColor);
+    text-align: center;
+    flex: 0 0 auto;
+}
+
+.sillynovel-new-chapter:disabled,
+.sillynovel-chapter-entry:disabled {
+    cursor: default;
+}
+
+/* --- editor column --- */
+
+.sillynovel-editor-column {
+    grid-area: editor;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    min-width: 0;
 }
 
 .sillynovel-chapter-title {
-    margin: 0 0 2px;
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 1.05);
+    overflow-wrap: anywhere;
 }
 
-.sillynovel-chapter-stats {
-    margin: 0 0 16px;
+.sillynovel-editor {
+    flex: 1 1 auto;
+    min-height: 120px;
+    resize: none;
+    padding: 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background-color: var(--black30a);
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    line-height: 1.6;
+}
+
+.sillynovel-editor[readonly] {
+    opacity: 0.85;
+}
+
+.sillynovel-save-status {
+    margin: 0;
+    min-height: 1.4em;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.7;
+}
+
+.sillynovel-save-status[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-inline-retry {
+    width: auto;
+    display: inline-block;
+    padding: 2px 8px;
+    border-color: var(--SmartThemeBorderColor);
+}
+
+/* --- suggestion pane --- */
+
+.sillynovel-suggestions {
+    grid-area: suggestions;
+    min-height: 0;
+    overflow-y: auto;
+    padding-left: 8px;
+    border-left: 1px solid var(--SmartThemeBorderColor);
+}
+
+@media (max-width: 1000px) {
+    .sillynovel-suggestions {
+        border-left: none;
+        border-top: 1px solid var(--SmartThemeBorderColor);
+        padding-left: 0;
+        padding-top: 8px;
+    }
+}
+
+.sillynovel-suggestions h5,
+.sillynovel-suggestions p {
+    margin: 0 0 6px;
+}
+
+.sillynovel-suggestions-empty {
     opacity: 0.7;
     font-size: calc(var(--mainFontSize) * 0.9);
 }
+
+/* --- context inspector --- */
+
+.sillynovel-inspector {
+    grid-area: inspector;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    padding-top: 8px;
+}
+
+.sillynovel-inspector-toggle {
+    border-color: var(--SmartThemeBorderColor);
+    width: auto;
+}
+
+.sillynovel-inspector-body {
+    padding-top: 8px;
+}
+
+.sillynovel-inspector-note {
+    margin: 0 0 6px;
+    opacity: 0.7;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.sillynovel-inspector-blocks {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-family: var(--monoFontFamily);
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
+}
+
+.sillynovel-inspector-blocks li {
+    border: 1px dashed var(--SmartThemeBorderColor);
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+
+/* --- error state --- */
 
 .sillynovel-workspace-error {
     border: 1px solid var(--SmartThemeBorderColor);

@@ -9,7 +9,8 @@
  *  - Use the stable context API via getContext(). Never import ST internals.
  */
 
-import { getSettings, resetWorkspace, resolveWorkspace } from './session.js';
+import { getSettings, resetWorkspace } from './session.js';
+import { renderWorkspace } from './view.js';
 
 const EXTENSION_NAME = 'sillynovel-writing';
 
@@ -152,86 +153,6 @@ function restoreFocus() {
     // are about to remove.
     if (document.activeElement instanceof HTMLElement) {
         document.activeElement.blur();
-    }
-}
-
-/**
- * Swap the body between its loading, ready and error states.
- *
- * Visibility is set here rather than trusted to the template's `hidden`
- * attributes: that markup passes through DOMPurify on the way in.
- *
- * @param {HTMLElement} panel
- * @param {'loading'|'ready'|'error'} state
- */
-function setWorkspaceState(panel, state) {
-    const regions = {
-        loading: panel.querySelector('.sillynovel-workspace-loading'),
-        ready: panel.querySelector('.sillynovel-workspace-ready'),
-        error: panel.querySelector('.sillynovel-workspace-error'),
-    };
-
-    for (const [name, element] of Object.entries(regions)) {
-        if (element) {
-            element.hidden = name !== state;
-        }
-    }
-}
-
-/**
- * Resolve which project and chapter are open, and show the result.
- *
- * Never throws: a failure here must leave the panel usable, showing why and
- * offering a retry, rather than propagating into the caller that mounted it.
- *
- * @param {HTMLElement} panel
- * @returns {Promise<void>}
- */
-async function renderWorkspace(panel) {
-    setWorkspaceState(panel, 'loading');
-
-    try {
-        const workspace = await resolveWorkspace();
-
-        // The panel may have been closed while resolution was in flight.
-        if (!panel.isConnected) {
-            return;
-        }
-
-        const setText = (selector, text) => {
-            const element = panel.querySelector(selector);
-            if (element) {
-                element.textContent = text;
-            }
-        };
-
-        const characters = [...workspace.content].length;
-
-        setText('.sillynovel-project-title', workspace.project.title);
-        setText('.sillynovel-chapter-title', workspace.chapter.title);
-        setText('.sillynovel-chapter-stats', `${characters} character${characters === 1 ? '' : 's'}`);
-
-        setWorkspaceState(panel, 'ready');
-    } catch (error) {
-        console.error(`[${EXTENSION_NAME}] could not open the workspace`, error);
-
-        if (!panel.isConnected) {
-            return;
-        }
-
-        const message = panel.querySelector('.sillynovel-error-message');
-        if (message) {
-            // Plugin error bodies never contain a path (plugin/index.js), so
-            // these messages are safe to show as-is.
-            message.textContent = error?.message ?? 'SillyNovel could not open the workspace.';
-        }
-
-        const retry = panel.querySelector('.sillynovel-retry');
-        if (retry) {
-            retry.onclick = () => renderWorkspace(panel);
-        }
-
-        setWorkspaceState(panel, 'error');
     }
 }
 

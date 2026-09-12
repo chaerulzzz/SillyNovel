@@ -1,21 +1,47 @@
 <!--
     SillyNovel — Writing Workspace body.
 
-    Phase 2, checkpoint 4: three states — loading, ready, error. There is no
-    editor here; the chapter's prose is loaded and held, but rendering it for
-    editing is checkpoint 5.
+    Phase 2, checkpoint 5: the five regions the shell provides — chapter
+    navigation, editor, save status, suggestion pane, and a Context Inspector
+    region. What fills them arrives later: the editor becomes writable in
+    checkpoint 6, the suggestion pane in 8, the Inspector in 9.
 
-    Visibility is driven from panel.js rather than trusted to these attributes:
-    this markup passes through DOMPurify on the way in.
+    Region visibility is driven from view.js rather than trusted to these
+    attributes: this markup passes through DOMPurify on the way in.
 -->
 <div class="sillynovel-workspace">
     <p class="sillynovel-workspace-loading">Opening your workspace…</p>
 
     <div class="sillynovel-workspace-ready" hidden>
-        <h4 class="sillynovel-project-title"></h4>
-        <p class="sillynovel-chapter-title"></p>
-        <p class="sillynovel-chapter-stats"></p>
-        <p class="sillynovel-workspace-note">The chapter editor arrives in checkpoint 5.</p>
+        <nav class="sillynovel-nav" aria-label="Chapters">
+            <h4 class="sillynovel-project-title"></h4>
+            <ul class="sillynovel-chapter-list"></ul>
+            <button type="button" class="sillynovel-new-chapter">New chapter</button>
+        </nav>
+
+        <div class="sillynovel-editor-column">
+            <h5 class="sillynovel-chapter-title"></h5>
+            <!--
+                Read-only until checkpoint 6 brings the save machine with it.
+                A textarea that accepts typing but cannot save is a way to lose
+                an author's work (hard rules 1 and 3).
+            -->
+            <textarea class="sillynovel-editor" readonly spellcheck="false"></textarea>
+            <p class="sillynovel-save-status" role="status"></p>
+        </div>
+
+        <aside class="sillynovel-suggestions" aria-label="Suggestions">
+            <h5>Suggestions</h5>
+            <p class="sillynovel-suggestions-empty">Generated suggestions appear here. Nothing is ever inserted into the manuscript on its own.</p>
+        </aside>
+
+        <section class="sillynovel-inspector" aria-label="Context Inspector">
+            <button type="button" class="sillynovel-inspector-toggle" aria-expanded="false">Context Inspector</button>
+            <div class="sillynovel-inspector-body" hidden>
+                <p class="sillynovel-inspector-note">Prompt blocks are labeled from the start. Contents arrive in checkpoint 9; block order is a tunable, not a decision.</p>
+                <ul class="sillynovel-inspector-blocks"></ul>
+            </div>
+        </section>
     </div>
 
     <div class="sillynovel-workspace-error" hidden>
