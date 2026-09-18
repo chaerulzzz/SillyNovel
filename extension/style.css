@@ -1,4 +1,821 @@
 /*
  * SillyNovel — Writing Workspace styles
- * Scaffold only; the workspace UI lands in Phase 2 (docs/PLAN.md).
+ *
+ * Coexistence with SillyTavern's own layout (Phase 2, checkpoint 3).
+ *
+ * !important throughout the coexistence rules is deliberate. Three things
+ * compete for these properties, and none of them live in public/style.css:
+ *
+ *   1. css/mobile-styles.css:306,372 — !important below 1000px, at ID
+ *      specificity for five drawers and #character_popup.
+ *   2. css/mobile-styles.css:582+ — @supports(-webkit-touch-callout), which
+ *      is NOT width-gated and beats .drawer-content on source order.
+ *   3. Moving UI — RossAscends-mods.js:657 + power-user.js:1835 write and
+ *      PERSIST inline styles on #sheld/#WorldInfo/#left-nav-panel/etc.
+ *
+ * Against 1 both sides are important, so specificity decides and our
+ * `body.<class> #id` (1,1,1) beats their `#id` (1,0,0). Against 2 we win
+ * either way. Against 3 only !important works, since an inline style beats
+ * any normal rule — and ST's .css() never writes !important.
+ *
+ * --sheldWidth is deliberately NOT redefined. ST derives .fillLeft/.fillRight
+ * geometry, .zoomed_avatar, --leftGapWidth and .drawer-content.maximized from
+ * it, so changing it silently moves all of them — and .fillLeft's width
+ * formula GROWS as --sheldWidth shrinks. Every element we care about gets an
+ * explicit width instead.
  */
+
+:root {
+    --sillynovel-panel-width: 70vw;
+}
+
+body.sillynovel-panel-open.sillynovel-panel-maximized {
+    --sillynovel-panel-width: 100vw;
+}
+
+body.sillynovel-panel-open {
+    /* The strip the panel does not cover. Single source of truth, read by the
+       panel's own width and by every override below, so they cannot drift. */
+    --sillynovel-left-region: calc(100vw - var(--sillynovel-panel-width));
+}
+
+/* --- Chat column and its (empty) backdrop bar --------------------------- */
+
+body.sillynovel-panel-open #sheld,
+body.sillynovel-panel-open #top-bar {
+    left: 0 !important;
+    right: var(--sillynovel-panel-width) !important;
+    width: auto !important;
+    min-width: 0 !important;    /* #sheld's own floor is 100px */
+    margin: 0 !important;
+}
+
+/* #sheld only — Moving UI persists inline top/bottom/height as well, which
+   would otherwise leave the chat column floating mid-screen. */
+body.sillynovel-panel-open #sheld {
+    top: var(--topBarBlockSize) !important;
+    bottom: auto !important;
+    height: calc(100dvh - var(--topBarBlockSize) - 1px) !important;
+}
+
+/* --- Drawer icon row ---------------------------------------------------- */
+
+/* In normal flow, so `right` does nothing — shrink it and let the margin push
+   it flush left. position/width are forced because mobile-styles.css:288
+   makes this element fixed at 100vw below 1000px. */
+body.sillynovel-panel-open #top-settings-holder {
+    position: relative !important;
+    width: var(--sillynovel-left-region) !important;
+    margin-left: 0 !important;
+    margin-right: auto !important;
+}
+
+/* --- Drawers: policy rule ----------------------------------------------- */
+
+/* (0,2,1). Beats .drawer-content's base rule and the @supports block above.
+   Covers the six plain drawers — #rm_api_block, #AdvancedFormatting,
+   #user-settings-block, #Backgrounds, #rm_extensions_block,
+   #PersonaManagement — and #WorldInfo, which is position:fixed, so left:0
+   lands it against the viewport, which is the same box. */
+body.sillynovel-panel-open .drawer-content {
+    left: 0 !important;
+    right: auto !important;
+    width: var(--sillynovel-left-region) !important;
+    max-width: var(--sillynovel-left-region) !important;
+    min-width: 0 !important;    /* defeats .drawer-content's own 450px floor */
+    margin: 0 !important;
+}
+
+/* --- Surfaces ST names by ID with !important ---------------------------- */
+
+/* (1,1,1). The policy rule above is only (0,2,1) and loses to
+   mobile-styles.css:306/372's ID-level !important below 1000px. Enumerated
+   from those two selector lists, minus #movingDivs>div (not an ID).
+   #character_popup is here for a second reason: at z-index 4001 it sits BELOW
+   our 4050 panel, so it must live in the left region rather than rely on
+   stacking to be visible. */
+body.sillynovel-panel-open #left-nav-panel,
+body.sillynovel-panel-open #right-nav-panel,
+body.sillynovel-panel-open #floatingPrompt,
+body.sillynovel-panel-open #cfgConfig,
+body.sillynovel-panel-open #logprobsViewer,
+body.sillynovel-panel-open #character_popup {
+    left: 0 !important;
+    right: auto !important;
+    width: var(--sillynovel-left-region) !important;
+    max-width: var(--sillynovel-left-region) !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+}
+
+/* --- ST's own drawer-maximize state ------------------------------------- */
+
+/* ST: body:not(.movingUI) .drawer-content.maximized { width: var(--sheldWidth)
+   !important; margin: 0 auto !important; right: 0 !important } at (0,3,1).
+   Ours matches at (0,3,1) and loads later, so it wins. Without this, a
+   maximized ST drawer re-centres at --sheldWidth and lands under the panel. */
+body.sillynovel-panel-open .drawer-content.maximized {
+    left: 0 !important;
+    right: auto !important;
+    width: var(--sillynovel-left-region) !important;
+    max-width: var(--sillynovel-left-region) !important;
+    margin: 0 !important;
+}
+
+/* --- Maximized workspace ------------------------------------------------ */
+
+/* Both classes are required: the maximized class must never hide ST unless
+   the panel is actually open. #WorldInfo needs no entry — it is a DOM
+   descendant of #top-settings-holder, so display:none removes it too,
+   position:fixed notwithstanding. #character_popup is NOT a descendant of it,
+   so it is listed explicitly. */
+body.sillynovel-panel-open.sillynovel-panel-maximized #sheld,
+body.sillynovel-panel-open.sillynovel-panel-maximized #top-bar,
+body.sillynovel-panel-open.sillynovel-panel-maximized #top-settings-holder,
+body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
+    display: none !important;
+}
+
+/* --- The panel itself --------------------------------------------------- */
+
+/* z-index 4050: above ST's chrome ceiling (#top-settings-holder escalates to
+   4005 while a drawer is open, #movingDivs>div is 4000) and below
+   #shadow_select_chat_popup (4100) and every generic popup (9999+), so ST's
+   own modal surfaces stay usable over the workspace. */
+.sillynovel-panel {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: var(--sillynovel-panel-width);
+    z-index: 4050;
+    display: flex;
+    flex-direction: column;
+    background-color: var(--SmartThemeBlurTintColor);
+    border-left: 1px solid var(--SmartThemeBorderColor);
+    color: var(--SmartThemeBodyColor);
+    overflow: hidden;
+}
+
+.sillynovel-panel:focus {
+    outline: none;
+}
+
+.sillynovel-panel-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+}
+
+.sillynovel-panel-title {
+    flex: 1 1 auto;
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 1.05);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sillynovel-panel-header button {
+    flex: 0 0 auto;
+    background: none;
+    border: none;
+    padding: 6px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    color: inherit;
+    font-size: inherit;
+    line-height: 1;
+    opacity: 0.7;
+}
+
+.sillynovel-panel-header button:hover,
+.sillynovel-panel-header button:focus-visible {
+    opacity: 1;
+    background-color: var(--white20a);
+}
+
+.sillynovel-panel-body {
+    flex: 1 1 auto;
+    /* min-height:0 lets this flex child actually shrink, which is what allows
+       the grid inside it to give its own regions independent scrolling instead
+       of pushing the panel taller. */
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px;
+}
+
+/* --- Workspace body (checkpoint 5) --------------------------------------
+ *
+ * Everything below is scoped inside .sillynovel-panel, so none of it meets the
+ * SillyTavern coexistence rules above and none of it needs !important — that
+ * mechanism stays confined to the rules that actually fight ST.
+ *
+ * Elements are styled explicitly rather than left to inherit: ST styles bare
+ * `button`, which is why the panel header buttons above carry their own reset.
+ * The same applies to the nav list and the editor.
+ */
+
+.sillynovel-workspace {
+    height: 100%;
+}
+
+.sillynovel-workspace-loading,
+.sillynovel-workspace-note {
+    opacity: 0.7;
+}
+
+/* ⚠️ An author `display` beats the UA's [hidden] rule outright — cascade origin,
+   not specificity — so .sillynovel-workspace-ready's `display: grid` below would
+   otherwise keep the ready region on screen during the loading and error states.
+   This restores [hidden] inside the workspace at (0,2,0), which also wins over
+   the region rules' (0,1,0). Without it, view.js's setWorkspaceState() silently
+   does nothing visible. */
+.sillynovel-workspace [hidden] {
+    display: none;
+}
+
+/* Docked at 70vw the panel is ~900px on a 1280px viewport, so the columns are
+   sized to keep the editor readable there, not only when maximized. */
+.sillynovel-workspace-ready {
+    display: grid;
+    grid-template-columns: minmax(140px, 200px) minmax(0, 1fr) minmax(160px, 240px);
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+        "nav editor suggestions"
+        "inspector inspector inspector";
+    gap: 12px;
+    height: 100%;
+    min-height: 0;
+}
+
+/* Below ~1000px SillyTavern's own !important regime narrows everything and the
+   docked panel is only ~300px wide. Three columns cannot survive that, so the
+   regions stack instead of overflowing. */
+@media (max-width: 1000px) {
+    .sillynovel-workspace-ready {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            "nav"
+            "editor"
+            "suggestions"
+            "inspector";
+        grid-template-rows: auto minmax(160px, 1fr) auto auto;
+        overflow-y: auto;
+    }
+
+}
+
+/* --- nav rail --- */
+
+.sillynovel-nav {
+    grid-area: nav;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 8px;
+    border-right: 1px solid var(--SmartThemeBorderColor);
+}
+
+@media (max-width: 1000px) {
+    .sillynovel-nav {
+        border-right: none;
+        border-bottom: 1px solid var(--SmartThemeBorderColor);
+        padding-right: 0;
+        padding-bottom: 8px;
+    }
+}
+
+.sillynovel-project-title {
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 1.05);
+    overflow-wrap: anywhere;
+}
+
+.sillynovel-chapter-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.sillynovel-chapter-entry,
+.sillynovel-new-chapter,
+.sillynovel-inspector-toggle,
+.sillynovel-inline-retry {
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 5px 8px;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    text-align: left;
+    cursor: pointer;
+    width: 100%;
+}
+
+.sillynovel-chapter-entry:hover,
+.sillynovel-new-chapter:hover,
+.sillynovel-inspector-toggle:hover,
+.sillynovel-chapter-entry:focus-visible,
+.sillynovel-new-chapter:focus-visible,
+.sillynovel-inspector-toggle:focus-visible {
+    background-color: var(--white20a);
+}
+
+.sillynovel-chapter-entry[aria-current="true"] {
+    border-color: var(--SmartThemeBorderColor);
+    font-weight: 600;
+}
+
+.sillynovel-busy {
+    opacity: 0.6;
+    cursor: progress;
+}
+
+.sillynovel-new-chapter {
+    border-color: var(--SmartThemeBorderColor);
+    text-align: center;
+    flex: 0 0 auto;
+}
+
+.sillynovel-new-chapter:disabled,
+.sillynovel-chapter-entry:disabled {
+    cursor: default;
+}
+
+/* --- editor column --- */
+
+.sillynovel-editor-column {
+    grid-area: editor;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    min-width: 0;
+}
+
+.sillynovel-chapter-title {
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 1.05);
+    overflow-wrap: anywhere;
+}
+
+.sillynovel-editor {
+    flex: 1 1 auto;
+    min-height: 120px;
+    resize: none;
+    padding: 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background-color: var(--black30a);
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    line-height: 1.6;
+}
+
+.sillynovel-save-status {
+    margin: 0;
+    min-height: 1.4em;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.7;
+}
+
+.sillynovel-save-status[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-inline-retry {
+    width: auto;
+    display: inline-block;
+    padding: 2px 8px;
+    border-color: var(--SmartThemeBorderColor);
+}
+
+/* --- suggestion pane --- */
+
+.sillynovel-suggestions {
+    grid-area: suggestions;
+    min-height: 0;
+    overflow-y: auto;
+    padding-left: 8px;
+    border-left: 1px solid var(--SmartThemeBorderColor);
+}
+
+@media (max-width: 1000px) {
+    .sillynovel-suggestions {
+        border-left: none;
+        border-top: 1px solid var(--SmartThemeBorderColor);
+        padding-left: 0;
+        padding-top: 8px;
+    }
+}
+
+.sillynovel-suggestions h5,
+.sillynovel-suggestions p {
+    margin: 0 0 6px;
+}
+
+.sillynovel-suggestions-empty {
+    opacity: 0.7;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+/* --- context inspector --- */
+
+/* The grid gives this region an `auto` row against the editor's
+   minmax(0, 1fr). Expanded with a full chapter in it the region is thousands of
+   pixels tall, the editor row is crushed toward zero, and because
+   .sillynovel-editor carries min-height it SPILLS rather than shrinking. The
+   bound belongs here rather than on the grid: one scroller, nothing truncated,
+   every byte still selectable and copyable. */
+.sillynovel-inspector {
+    grid-area: inspector;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    padding-top: 8px;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+/* ⚠️ Must come AFTER the rule above, not beside the other stacked-layout
+   rules in the earlier media query: both selectors have the same specificity,
+   so whichever is declared last wins. Below 1000px .sillynovel-workspace-ready
+   already scrolls, and leaving the bound on would nest one scroller inside
+   another. Stacked, the region simply grows and the workspace scrolls it. */
+@media (max-width: 1000px) {
+    .sillynovel-inspector {
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+
+.sillynovel-inspector-toggle {
+    border-color: var(--SmartThemeBorderColor);
+    width: auto;
+}
+
+.sillynovel-inspector-body {
+    padding-top: 8px;
+}
+
+.sillynovel-inspector-note {
+    margin: 0 0 6px;
+    opacity: 0.7;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.sillynovel-inspector-blocks {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: var(--monoFontFamily);
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
+}
+
+/* Dashed = not sent. The wire list below is solid, and the contrast is the
+   fastest read in the region. */
+.sillynovel-inspector-blocks li {
+    border: 1px dashed var(--SmartThemeBorderColor);
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+
+.sillynovel-inspector-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.sillynovel-inspector-status {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.75;
+}
+
+.sillynovel-inspector-status[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-inspector-stale,
+.sillynovel-inspector-refusal {
+    margin: 0 0 8px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-inspector-refusal {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.sillynovel-inspector-empty,
+.sillynovel-inspector-caveat {
+    margin: 0 0 8px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.7;
+}
+
+.sillynovel-inspector-heading {
+    margin: 12px 0 6px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+}
+
+.sillynovel-inspector-figures {
+    list-style: none;
+    margin: 0 0 8px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.sillynovel-inspector-figures li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.sillynovel-inspector-figure-label {
+    opacity: 0.75;
+}
+
+.sillynovel-inspector-figure-value {
+    font-family: var(--monoFontFamily);
+    white-space: nowrap;
+}
+
+.sillynovel-inspector-wire {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.sillynovel-inspector-message {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+/* No opacity reduction: this line carries the position, which is the whole
+   point of rendering the list in send order. */
+.sillynovel-inspector-message-head {
+    margin: 0 0 2px;
+    font-family: var(--monoFontFamily);
+    font-size: calc(var(--mainFontSize) * 0.85);
+    font-weight: 600;
+}
+
+.sillynovel-inspector-message-reason {
+    margin: 0 0 6px;
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
+}
+
+/* A div, not a pre: `white-space: pre` would scroll a long chapter sideways,
+   and ST styles bare elements. Monospace signals payload rather than prose. */
+.sillynovel-inspector-message-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--monoFontFamily);
+    font-size: calc(var(--mainFontSize) * 0.85);
+    line-height: 1.5;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background-color: var(--black30a);
+}
+
+/* --- error state --- */
+
+.sillynovel-workspace-error {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.sillynovel-error-message {
+    margin: 0 0 12px;
+}
+
+.sillynovel-retry {
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 6px 12px;
+    color: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.sillynovel-retry:hover,
+.sillynovel-retry:focus-visible {
+    background-color: var(--white20a);
+}
+
+/* --- Save status emphasis (checkpoint 6) -------------------------------- */
+
+/* A conflict is the one status the author must actually read: their words are
+   unsaved and will not save until they act. Everything else is ambient. */
+.sillynovel-save-status[data-state="conflict"] {
+    opacity: 1;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 6px 8px;
+}
+
+.sillynovel-save-status[data-state="saving"],
+.sillynovel-save-status[data-state="dirty"] {
+    opacity: 0.85;
+}
+
+.sillynovel-editor[readonly] {
+    opacity: 0.85;
+}
+
+/* --- Recovery offer (checkpoint 7) -------------------------------------- */
+
+/* The author's unsaved writing is on screen but stored nowhere durable yet, so
+   this is the one region in the editor column that should be hard to miss. */
+.sillynovel-recovery {
+    flex: 0 0 auto;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background-color: var(--white20a);
+}
+
+.sillynovel-recovery-message {
+    margin: 0 0 8px;
+}
+
+.sillynovel-recovery-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sillynovel-recovery-keep,
+.sillynovel-recovery-discard {
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 5px 10px;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.sillynovel-recovery-keep:hover,
+.sillynovel-recovery-discard:hover,
+.sillynovel-recovery-keep:focus-visible,
+.sillynovel-recovery-discard:focus-visible {
+    background-color: var(--white30a);
+}
+
+/* --- Continue, preflight, suggestions (checkpoint 8) --------------------- */
+
+.sillynovel-actions {
+    flex: 0 0 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.sillynovel-continue,
+.sillynovel-cancel,
+.sillynovel-preflight-confirm,
+.sillynovel-preflight-cancel,
+.sillynovel-insert,
+.sillynovel-copy,
+.sillynovel-discard,
+.sillynovel-inspector-refresh,
+.sillynovel-inspector-copy {
+    width: auto;
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 5px 12px;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.sillynovel-continue:hover,
+.sillynovel-cancel:hover,
+.sillynovel-preflight-confirm:hover,
+.sillynovel-preflight-cancel:hover,
+.sillynovel-insert:hover,
+.sillynovel-copy:hover,
+.sillynovel-discard:hover,
+.sillynovel-inspector-refresh:hover,
+.sillynovel-inspector-copy:hover,
+.sillynovel-inspector-refresh:focus-visible,
+.sillynovel-inspector-copy:focus-visible,
+.sillynovel-continue:focus-visible,
+.sillynovel-cancel:focus-visible,
+.sillynovel-preflight-confirm:focus-visible,
+.sillynovel-preflight-cancel:focus-visible,
+.sillynovel-insert:focus-visible,
+.sillynovel-copy:focus-visible,
+.sillynovel-discard:focus-visible {
+    background-color: var(--white30a);
+}
+
+.sillynovel-continue:disabled,
+.sillynovel-insert:disabled,
+.sillynovel-inspector-refresh:disabled,
+.sillynovel-inspector-copy:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.sillynovel-action-note,
+.sillynovel-trim-note {
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.75;
+    overflow-wrap: anywhere;
+}
+
+.sillynovel-action-note[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+/* Cost preflight — AGENTS.md rule 6. Nothing has been sent at this point, so
+   this has to read as a question rather than as a progress message. */
+.sillynovel-preflight {
+    flex: 0 0 auto;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background-color: var(--white20a);
+}
+
+.sillynovel-preflight-message {
+    margin: 0 0 8px;
+    white-space: pre-line;
+}
+
+.sillynovel-preflight-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sillynovel-suggestions-status[data-state="error"] {
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-suggestion-stale {
+    margin: 0 0 6px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+/* pre-wrap, because the prose is set with textContent — never innerHTML — and
+   paragraph breaks have to survive that. */
+.sillynovel-suggestion-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.6;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background-color: var(--black30a);
+}
+
+.sillynovel-suggestion-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sillynovel-inline-retry + .sillynovel-inline-retry {
+    margin-left: 4px;
+}
