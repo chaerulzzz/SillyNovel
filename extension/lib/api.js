@@ -31,8 +31,8 @@ export const ApiErrorKind = {
     /** The plugin answered with an error code. */
     REQUEST: 'request',
     /**
-     * 412: the document — a chapter, or the Writing Profile — changed somewhere
-     * else since we read it. Distinct from
+     * 412: the document — a chapter, its notes, or the Writing Profile — changed
+     * somewhere else since we read it. Distinct from
      * REQUEST because PLAN.md requires a conflict WARNING rather than a generic
      * failure — the author's unsaved words are at stake, not a retryable call.
      */
@@ -264,6 +264,35 @@ export async function putChapter(projectId, chapterId, content, etag) {
     );
 
     return { ...payload, etag: requireEtag(payload, 'the saved chapter') };
+}
+
+/**
+ * A chapter's notes. Absent notes read as '' with the digest of '', so a
+ * chapter that has never had a note needs no special case — 404 on this route
+ * means the chapter itself is gone.
+ *
+ * @returns {Promise<{id: string, content: string, etag: string}>}
+ */
+export async function getNotes(projectId, chapterId) {
+    const payload = await request('GET', `/projects/${projectId}/chapters/${chapterId}/notes`);
+    return { ...payload, etag: requireEtag(payload, 'the chapter notes') };
+}
+
+/**
+ * Replace a chapter's notes, as a compare-and-swap. Same contract as putChapter.
+ *
+ * @param {string} etag bare 64-hex digest
+ * @returns {Promise<{id: string, etag: string}>}
+ */
+export async function putNotes(projectId, chapterId, content, etag) {
+    const payload = await request(
+        'PUT',
+        `/projects/${projectId}/chapters/${chapterId}/notes`,
+        { content },
+        { 'If-Match': quoteEtag(etag) },
+    );
+
+    return { ...payload, etag: requireEtag(payload, 'the saved notes') };
 }
 
 /** @param {object} payload @param {string} what */

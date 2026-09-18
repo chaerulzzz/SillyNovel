@@ -65,6 +65,19 @@
                     <button type="button" class="sillynovel-preflight-cancel">Not now</button>
                 </div>
             </div>
+
+            <!--
+                Per-chapter notes (Phase 3). The status line sits OUTSIDE the
+                collapsible body: a conflict can land after the author collapses
+                the region, and it has to stay visible.
+            -->
+            <section class="sillynovel-notes" aria-label="Notes for this chapter">
+                <button type="button" class="sillynovel-notes-toggle" aria-expanded="false">Notes for this chapter</button>
+                <div class="sillynovel-notes-body" hidden>
+                    <textarea class="sillynovel-notes-editor" rows="6" spellcheck="false" aria-label="Notes for this chapter"></textarea>
+                </div>
+                <p class="sillynovel-notes-status" role="status"></p>
+            </section>
         </div>
 
         <aside class="sillynovel-suggestions" aria-label="Suggestions">

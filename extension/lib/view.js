@@ -14,9 +14,12 @@ import { ApiErrorKind } from './api.js';
 import {
     acceptOffer,
     addChapter,
+    clearNotesOversizeHalt,
     clearOversizeHalt,
     declineOffer,
     getHalt,
+    getNotes,
+    getNotesHalt,
     getPendingOffer,
     getProfile,
     getProfileHalt,
@@ -28,6 +31,7 @@ import {
     reloadProfile,
     resolveWorkspace,
     saveChapter,
+    saveNotes,
     saveProfile,
 } from './session.js';
 import {
@@ -72,9 +76,6 @@ const SAVE_STATUS = {
     conflict: CONFLICT_MESSAGE,
     error: 'Could not save',
 };
-
-/** Pending idle-save timer, or null. */
-let saveTimer = null;
 
 /**
  * Local recovery write delay. Much tighter than the server debounce because the
@@ -256,195 +257,361 @@ function editorOf(panel) {
     return panel.querySelector('.sillynovel-editor');
 }
 
-/**
- * Does the editor hold bytes the server does not?
- * @param {HTMLElement} panel
- */
-function isDirty(panel) {
-    const workspace = getWorkspace();
-    const editor = editorOf(panel);
+/* --- the per-document saver (Phase 3 checkpoint 3) ----------------------
 
-    return Boolean(workspace && editor) && editor.value !== workspace.content;
-}
-
-function cancelScheduledSave() {
-    if (saveTimer !== null) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-    }
-}
-
-/** @param {HTMLElement} panel */
-function scheduleSave(panel) {
-    cancelScheduledSave();
-    saveTimer = setTimeout(() => { void autoSave(panel); }, SAVE_DEBOUNCE_MS);
-}
+   Checkpoint 6 built this machine for the chapter on module-global state: one
+   timer, one status element, one dirty comparison. Notes need the same machine
+   for a second document, and a copy-pasted second machine is exactly where the
+   halt/settle semantics would drift. So the machine is a factory, and the
+   chapter is its first instance — configured to behave byte-for-byte as before,
+   with the old function names kept as destructured aliases so no call site
+   changed. What stays OUTSIDE the saver is chapter-only by nature: the local
+   draft timer and recovery offer, the stale marks, and setActionError. */
 
 /**
- * What to do once a save has settled, either way.
- *
- * ⚠️ This has to be STATE-aware, not merely content-aware. After a 412 the
- * editor still differs from the stored content, so a purely dirty-based check
- * would fire again immediately: PUT -> 412 -> settle -> PUT, forever, which is
- * the opposite of "autosave halts". And re-saving inline rather than re-arming
- * the debounce turns a transient 5xx into a tight retry loop with no pacing.
- *
- * @param {HTMLElement} panel
+ * @param {object} config
+ * @param {string} config.name for log lines
+ * @param {number} config.debounceMs idle delay before a save
+ * @param {(panel: HTMLElement) => string|null} config.read the textarea's text, null if absent
+ * @param {() => string|null} config.saved the server-held text, null if nothing is open
+ * @param {() => string|null} config.halt why saving has stopped, or null
+ * @param {(text: string) => Promise<object|null>} config.save the session.js save
+ * @param {(panel: HTMLElement, state: string, text?: string) => void} config.status
+ * @param {Record<string, [string, string|undefined]>} config.haltStatus what to paint per halt reason
  */
-function settleSave(panel) {
-    if (!panel.isConnected) {
-        cancelScheduledSave();
-        return;
+function createSaver({ name, debounceMs, read, saved, halt, save, status, haltStatus }) {
+    /** Pending idle-save timer, or null. Private to this document. */
+    let timer = null;
+
+    /** Does the textarea hold bytes the server does not? */
+    function isDirty(panel) {
+        const server = saved();
+        const text = read(panel);
+
+        return server !== null && text !== null && text !== server;
     }
 
-    if (getHalt() !== null) {
-        return;
+    function cancel() {
+        if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+        }
     }
 
-    if (isDirty(panel)) {
-        scheduleSave(panel);
-    }
-}
-
-/**
- * Put the halted status back on screen.
- *
- * runAction() writes a progress message ("Opening chapter…") into the same
- * region before it calls anything, so a navigation attempt on a halted chapter
- * would otherwise bury the very warning that explains why it was refused.
- *
- * @param {HTMLElement} panel
- * @returns {boolean} whether a halt was in force
- */
-function renderHaltStatus(panel) {
-    const halt = getHalt();
-
-    if (halt === 'offer') {
-        setSaveStatus(panel, 'offer', 'Choose which version to keep before saving.');
-        return true;
+    function schedule(panel) {
+        cancel();
+        timer = setTimeout(() => { void autoSave(panel); }, debounceMs);
     }
 
-    if (halt === 'conflict') {
-        setSaveStatus(panel, 'conflict');
-        return true;
-    }
-
-    if (halt === 'oversize') {
-        setSaveStatus(panel, 'error', 'This chapter is too large to save. Shorten it and saving will resume.');
-        return true;
-    }
-
-    return false;
-}
-
-/**
- * @param {HTMLElement} panel
- * @param {unknown} error
- */
-function renderSaveFailure(panel, error) {
-    if (error?.kind === ApiErrorKind.CONFLICT) {
-        setSaveStatus(panel, 'conflict');
-        return;
-    }
-
-    setSaveStatus(panel, 'error', error?.message ?? SAVE_STATUS.error);
-}
-
-/**
- * One save attempt. Never throws — the status region is the report.
- *
- * Three outcomes, not two: "still dirty" has to be distinguishable from
- * "failed", because saveChapter coalesces onto an in-flight PUT that may have
- * carried older text. Collapsing them would make a navigation flush abort on a
- * perfectly healthy coalesced save.
- *
- * @param {HTMLElement} panel
- * @returns {Promise<'clean'|'dirty'|'failed'>}
- */
-async function autoSave(panel) {
-    cancelScheduledSave();
-
-    if (renderHaltStatus(panel)) {
-        return 'failed';
-    }
-
-    if (!isDirty(panel)) {
-        // Nothing to send. Settle the status rather than leaving whatever the
-        // trigger left behind — "Unsaved changes" with nothing unsaved is a lie.
-        setSaveStatus(panel, 'idle');
-        return 'clean';
-    }
-
-    setSaveStatus(panel, 'saving');
-
-    try {
-        await saveChapter(editorOf(panel).value);
-
+    /**
+     * What to do once a save has settled, either way.
+     *
+     * ⚠️ This has to be STATE-aware, not merely content-aware. After a 412 the
+     * textarea still differs from the stored content, so a purely dirty-based
+     * check would fire again immediately: PUT -> 412 -> settle -> PUT, forever,
+     * which is the opposite of "autosave halts". And re-saving inline rather
+     * than re-arming the debounce turns a transient 5xx into a tight retry loop
+     * with no pacing.
+     */
+    function settle(panel) {
         if (!panel.isConnected) {
-            return 'failed';
+            cancel();
+            return;
+        }
+
+        if (halt() !== null) {
+            return;
         }
 
         if (isDirty(panel)) {
-            return 'dirty';
+            schedule(panel);
+        }
+    }
+
+    /**
+     * Put the halted status back on screen.
+     *
+     * runAction() writes a progress message ("Opening chapter…") into the
+     * chapter's region before it calls anything, so a navigation attempt on a
+     * halted document would otherwise bury the very warning that explains why
+     * it was refused.
+     *
+     * @returns {boolean} whether a halt was in force
+     */
+    function renderHalt(panel) {
+        const reason = halt();
+
+        if (reason === null || !(reason in haltStatus)) {
+            return false;
         }
 
-        setSaveStatus(panel, 'saved');
-        return 'clean';
-    } catch (error) {
-        console.error(`[${EXTENSION_NAME}] save failed`, error);
+        const [state, text] = haltStatus[reason];
+        status(panel, state, text);
+        return true;
+    }
 
-        if (panel.isConnected) {
-            renderSaveFailure(panel, error);
+    function renderFailure(panel, error) {
+        if (error?.kind === ApiErrorKind.CONFLICT) {
+            status(panel, 'conflict');
+            return;
         }
 
-        return 'failed';
-    } finally {
-        settleSave(panel);
+        status(panel, 'error', error?.message);
+    }
+
+    /**
+     * One save attempt. Never throws — the status region is the report.
+     *
+     * Three outcomes, not two: "still dirty" has to be distinguishable from
+     * "failed", because the session save coalesces onto an in-flight PUT that
+     * may have carried older text. Collapsing them would make a navigation
+     * flush abort on a perfectly healthy coalesced save.
+     *
+     * @returns {Promise<'clean'|'dirty'|'failed'>}
+     */
+    async function autoSave(panel) {
+        cancel();
+
+        if (renderHalt(panel)) {
+            return 'failed';
+        }
+
+        if (!isDirty(panel)) {
+            // Nothing to send. Settle the status rather than leaving whatever
+            // the trigger left behind — "Unsaved changes" with nothing unsaved
+            // is a lie.
+            status(panel, 'idle');
+            return 'clean';
+        }
+
+        status(panel, 'saving');
+
+        try {
+            await save(read(panel));
+
+            if (!panel.isConnected) {
+                return 'failed';
+            }
+
+            if (isDirty(panel)) {
+                return 'dirty';
+            }
+
+            status(panel, 'saved');
+            return 'clean';
+        } catch (error) {
+            console.error(`[${EXTENSION_NAME}] ${name} save failed`, error);
+
+            if (panel.isConnected) {
+                renderFailure(panel, error);
+            }
+
+            return 'failed';
+        } finally {
+            settle(panel);
+        }
+    }
+
+    /**
+     * Flush before leaving the chapter. Bounded rather than single-shot: the
+     * session save coalesces onto an in-flight PUT, which may have carried
+     * older text, so one pass is not always enough.
+     *
+     * @returns {Promise<boolean>} false means do NOT navigate
+     */
+    async function flush(panel) {
+        // A pending recovery OFFER is the deliberate exception to "a halt
+        // aborts navigation": the draft is durable in IndexedDB and the offer
+        // reappears when the author comes back, so there is nothing to lose by
+        // leaving. Chapter-only by construction — no other document has a
+        // recovery store, so no other halt() can ever return 'offer'. A
+        // conflict halt is different: that text exists nowhere else.
+        if (halt() === 'offer') {
+            return true;
+        }
+
+        // Already halted: nothing will save, so say so again rather than
+        // leaving whatever progress message the caller just wrote.
+        if (halt() !== null) {
+            renderHalt(panel);
+            return false;
+        }
+
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const outcome = await autoSave(panel);
+
+            if (outcome === 'clean') {
+                return true;
+            }
+
+            // A real failure aborts immediately rather than being retried here
+            // — pacing belongs to settle()'s debounce, not to a navigation click.
+            if (outcome === 'failed' || !panel.isConnected) {
+                return false;
+            }
+        }
+
+        return !isDirty(panel);
+    }
+
+    /** The consequences of the text changing, once the document-specific hooks have run. */
+    function handleChange(panel) {
+        // A conflict is sticky against every trigger. Showing "dirty" here
+        // would tell the author their words are about to be saved when they
+        // are not.
+        if (halt() !== null) {
+            return;
+        }
+
+        // Dirtiness is a comparison, not a consequence of typing: editing back
+        // to the saved text must not keep claiming there is something to save.
+        if (!isDirty(panel)) {
+            cancel();
+            status(panel, 'idle');
+            return;
+        }
+
+        status(panel, 'dirty');
+        schedule(panel);
+    }
+
+    /** Best-effort save as the panel closes. Fire-and-forget by necessity. */
+    function flushOnClose(panel) {
+        cancel();
+
+        if (halt() !== null || !isDirty(panel)) {
+            return;
+        }
+
+        void save(read(panel)).catch(() => {
+            // Nothing left to tell: the panel is going away.
+        });
+    }
+
+    return { isDirty, cancel, schedule, settle, renderHalt, renderFailure, autoSave, flush, handleChange, flushOnClose };
+}
+
+/** The chapter: the first instance, configured to behave exactly as checkpoint 6 built it. */
+const chapterSaver = createSaver({
+    name: 'chapter',
+    debounceMs: SAVE_DEBOUNCE_MS,
+    read: (panel) => editorOf(panel)?.value ?? null,
+    saved: () => getWorkspace()?.content ?? null,
+    halt: getHalt,
+    save: saveChapter,
+    status: setSaveStatus,
+    haltStatus: {
+        offer: ['offer', 'Choose which version to keep before saving.'],
+        conflict: ['conflict', undefined],
+        oversize: ['error', 'This chapter is too large to save. Shorten it and saving will resume.'],
+    },
+});
+
+// The checkpoint-6 names, so no call site in this file changed.
+const {
+    isDirty,
+    cancel: cancelScheduledSave,
+    schedule: scheduleSave,
+    renderHalt: renderHaltStatus,
+    autoSave,
+} = chapterSaver;
+
+const NOTES_CONFLICT_MESSAGE =
+    'These notes changed somewhere else, so your notes will not be saved. Copy them out of this box before '
+    + 'switching chapters, closing or reloading — they are not stored anywhere else.';
+
+/** The idle line is empty on purpose: it sits under a collapsed toggle and must stay quiet. */
+const NOTES_STATUS = {
+    idle: '',
+    dirty: 'Unsaved notes',
+    saving: 'Saving notes…',
+    saved: 'Notes saved',
+    conflict: NOTES_CONFLICT_MESSAGE,
+    error: 'Could not save notes',
+};
+
+/** @param {HTMLElement} panel */
+function notesEditorOf(panel) {
+    return panel.querySelector('.sillynovel-notes-editor');
+}
+
+/**
+ * @param {HTMLElement} panel
+ * @param {string} state
+ * @param {string} [text]
+ */
+function setNotesStatus(panel, state, text) {
+    const element = panel.querySelector('.sillynovel-notes-status');
+
+    if (element) {
+        element.dataset.state = state;
+        element.textContent = text ?? NOTES_STATUS[state] ?? '';
     }
 }
 
 /**
- * Flush before leaving the chapter — ARCHITECTURE.md:461 counts internal
- * navigation as a save trigger, and both openChapter and addChapter overwrite
- * the open chapter's content.
+ * Per-chapter notes: the second instance. No draft timer, no recovery offer,
+ * no stale marks — notes are not in the prompt at this checkpoint, and the
+ * recovery store is keyed by chapter alone, so a notes write there would
+ * overwrite the chapter's record.
+ */
+const notesSaver = createSaver({
+    name: 'notes',
+    debounceMs: SAVE_DEBOUNCE_MS,
+    read: (panel) => notesEditorOf(panel)?.value ?? null,
+    saved: () => getNotes()?.content ?? null,
+    halt: getNotesHalt,
+    save: saveNotes,
+    status: setNotesStatus,
+    haltStatus: {
+        conflict: ['conflict', undefined],
+        oversize: ['error', 'These notes are too large to save. Shorten them and saving will resume.'],
+    },
+});
+
+/** Every document with a saver, chapter first. */
+const SAVERS = [chapterSaver, notesSaver];
+
+/**
+ * Everything that must happen when the notes text changes, from ANY cause.
+ * A function, not an inline listener, so checkpoint 5's "Add to notes" can
+ * call it after a programmatic write — exactly as insertSuggestion calls
+ * handleEditorChange. Idempotent for the same reason.
  *
- * Bounded rather than single-shot: saveChapter coalesces onto an in-flight PUT,
- * which may have carried older text, so one pass is not always enough.
+ * @param {HTMLElement} panel
+ */
+function handleNotesChange(panel) {
+    // Shortening is the only thing that can fix a 413, so editing is exactly
+    // when saving should resume.
+    clearNotesOversizeHalt();
+    notesSaver.handleChange(panel);
+}
+
+/**
+ * Flush every document before leaving the chapter — ARCHITECTURE.md:461 counts
+ * internal navigation as a save trigger, and both openChapter and addChapter
+ * overwrite the open chapter's content. Every saver gets its attempt; any
+ * refusal aborts.
  *
  * @param {HTMLElement} panel
  * @returns {Promise<boolean>} false means do NOT navigate
  */
 async function flushBeforeNavigation(panel) {
-    // A pending offer is the deliberate exception to "a halt aborts navigation":
-    // the draft is durable in IndexedDB and the offer reappears when the author
-    // comes back, so there is nothing to lose by leaving. A conflict halt is
-    // different — that text exists nowhere else.
-    if (getHalt() === 'offer') {
-        return true;
+    let ok = true;
+
+    for (const saver of SAVERS) {
+        if (!(await saver.flush(panel))) {
+            ok = false;
+        }
     }
 
-    // Already halted: nothing will save, so say so again rather than leaving
-    // whatever progress message the caller just wrote.
-    if (getHalt() !== null) {
+    // A later saver's refusal must not leave "Opening chapter…" standing over
+    // the chapter's own halt or recovery banner.
+    if (!ok) {
         renderHaltStatus(panel);
-        return false;
     }
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-        const outcome = await autoSave(panel);
-
-        if (outcome === 'clean') {
-            return true;
-        }
-
-        // A real failure aborts immediately rather than being retried here —
-        // pacing belongs to settleSave()'s debounce, not to a navigation click.
-        if (outcome === 'failed' || !panel.isConnected) {
-            return false;
-        }
-    }
-
-    return !isDirty(panel);
+    return ok;
 }
 
 /**
@@ -637,10 +804,17 @@ function renderWorkspaceContent(panel, workspace) {
         editor.value = workspace.content;
     }
 
+    // Notes are chapter-scoped, so unlike the profile they ARE repainted here.
+    const notes = notesEditorOf(panel);
+    if (notes) {
+        notes.value = workspace.notes?.content ?? '';
+    }
+
     renderNav(panel, workspace);
 
     cancelScheduledSave();
     cancelScheduledDraft();
+    notesSaver.cancel();
 
     // A suggestion belongs to the chapter it came from, and a trim notice to the
     // request that caused it. The action bar is repainted from the LIVE
@@ -663,6 +837,10 @@ function renderWorkspaceContent(panel, workspace) {
         setSaveStatus(panel, 'idle');
     } else {
         renderHaltStatus(panel);
+    }
+
+    if (!notesSaver.renderHalt(panel)) {
+        setNotesStatus(panel, 'idle');
     }
 }
 
@@ -700,22 +878,7 @@ function handleEditorChange(panel) {
     // no longer matches the editor is no longer the prompt Continue would send.
     renderInspectorStale(panel);
 
-    // A conflict is sticky against every trigger. Showing "dirty" here would
-    // tell the author their words are about to be saved when they are not.
-    if (getHalt() !== null) {
-        return;
-    }
-
-    // Dirtiness is a comparison, not a consequence of typing: editing back to
-    // the saved text must not keep claiming there is something to save.
-    if (!isDirty(panel)) {
-        cancelScheduledSave();
-        setSaveStatus(panel, 'idle');
-        return;
-    }
-
-    setSaveStatus(panel, 'dirty');
-    scheduleSave(panel);
+    chapterSaver.handleChange(panel);
 }
 
 /* --- Continue and the suggestion pane (checkpoint 8) --------------------- */
@@ -2318,6 +2481,39 @@ function wireProfile(panel) {
 }
 
 /**
+ * Wire the notes region. Called once per mount, like wireEditor.
+ *
+ * The disclosure state is NOT reset on a chapter switch — renderWorkspaceContent
+ * repaints the text and never touches `hidden`, so an author who keeps notes
+ * open keeps them open, as with the Inspector.
+ *
+ * @param {HTMLElement} panel
+ */
+function wireNotes(panel) {
+    const toggle = panel.querySelector('.sillynovel-notes-toggle');
+    const body = panel.querySelector('.sillynovel-notes-body');
+    const editor = notesEditorOf(panel);
+
+    if (toggle && body) {
+        // Set explicitly rather than relying on the template's `hidden`
+        // surviving DOMPurify, so "collapsed by default" is our guarantee.
+        body.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+
+        toggle.onclick = () => {
+            const open = toggle.getAttribute('aria-expanded') === 'true';
+            toggle.setAttribute('aria-expanded', String(!open));
+            body.hidden = open;
+        };
+    }
+
+    if (editor) {
+        editor.addEventListener('input', () => { handleNotesChange(panel); });
+        editor.addEventListener('blur', () => { void notesSaver.autoSave(panel); });
+    }
+}
+
+/**
  * Attach the editor's save triggers. Called once per mount.
  *
  * ARCHITECTURE.md:461: idle debounce, blur, visibilitychange, and internal
@@ -2352,6 +2548,13 @@ function wireEditor(panel) {
         // with.
         if (event.target instanceof Element && event.target.closest('.sillynovel-profile')) {
             void saveProfileNow(panel);
+            return;
+        }
+
+        // Before the offer check: the offer belongs to the chapter, and a
+        // shortcut pressed inside the notes must not be diverted to its banner.
+        if (event.target instanceof Element && event.target.closest('.sillynovel-notes')) {
+            void notesSaver.autoSave(panel);
             return;
         }
 
@@ -2428,6 +2631,7 @@ document.addEventListener('visibilitychange', () => {
 
     if (panel) {
         void autoSave(panel);
+        void notesSaver.autoSave(panel);
         flushProfile(panel);
     }
 });
@@ -2472,13 +2676,9 @@ export function flushOnClose() {
     // must not stop it from reaching the server.
     flushProfile(panel);
 
-    if (getHalt() !== null || !isDirty(panel)) {
-        return;
-    }
-
-    void saveChapter(editorOf(panel).value).catch(() => {
-        // Nothing left to tell: the panel is going away.
-    });
+    chapterSaver.flushOnClose(panel);
+    // No recordDraft on this path: notes have no recovery copy by design.
+    notesSaver.flushOnClose(panel);
 }
 
 /**
@@ -2505,6 +2705,7 @@ export async function renderWorkspace(panel) {
         wireProfile(panel);
         renderProfileForm(panel);
         wireEditor(panel);
+        wireNotes(panel);
 
         const newChapter = panel.querySelector('.sillynovel-new-chapter');
         if (newChapter) {
