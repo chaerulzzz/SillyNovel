@@ -27,8 +27,10 @@ import {
     listProjects,
     parseIfMatch,
     readChapter,
+    readNotes,
     readProfile,
     writeChapter,
+    writeNotes,
     writeProfile,
 } from './lib/store.js';
 
@@ -122,7 +124,7 @@ function route(handler) {
  */
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.json({ ok: true, plugin: info.id, version: '0.3.0' });
+        response.json({ ok: true, plugin: info.id, version: '0.4.0' });
     });
 
     router.get('/projects', route(async (_request, response, root) => {
@@ -155,6 +157,27 @@ export async function init(router) {
         const expected = parseIfMatch(request.get('If-Match'));
         const body = await readJsonBody(request);
         const result = await writeChapter(
+            root,
+            request.params.projectId,
+            request.params.chapterId,
+            body?.content,
+            expected,
+        );
+        response.set('ETag', `"${result.etag}"`).json(result);
+    }));
+
+    // Per-chapter notes (Phase 3). The chapter's compare-and-swap discipline;
+    // an absent note reads as '' with the digest of '', and the chapter itself
+    // must exist.
+    router.get('/projects/:projectId/chapters/:chapterId/notes', route(async (request, response, root) => {
+        const result = await readNotes(root, request.params.projectId, request.params.chapterId);
+        response.set('ETag', `"${result.etag}"`).json(result);
+    }));
+
+    router.put('/projects/:projectId/chapters/:chapterId/notes', route(async (request, response, root) => {
+        const expected = parseIfMatch(request.get('If-Match'));
+        const body = await readJsonBody(request);
+        const result = await writeNotes(
             root,
             request.params.projectId,
             request.params.chapterId,

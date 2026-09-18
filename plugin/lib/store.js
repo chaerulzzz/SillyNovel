@@ -6,7 +6,12 @@
  *   <canonical user root>/sillynovel/projects/<uuid>/
  *   ├── project.json          schemaVersion, id, title, revision, chapters[]
  *   ├── profile.json          the Writing Profile (Phase 3), seven string fields
- *   └── chapters/<uuid>.md    pure prose, nothing else
+ *   ├── chapters/<uuid>.md    pure prose, nothing else
+ *   └── notes/<uuid>.md       per-chapter notes (Phase 3), keyed by the chapter id
+ *
+ * ⚠️ notes/ is invisible to listing and reconciliation — chapterIdsOnDisk
+ * enumerates chapters/ only — so nothing here cleans it up. Phase 5's delete
+ * must remove notes/<id>.md alongside chapters/<id>.md.
  *
  * ONE FILE PER CHAPTER. The revision IS a SHA-256 digest of the chapter's
  * bytes, computed on read — so prose and revision cannot disagree, because
@@ -27,6 +32,7 @@ import {
     containedPath,
     ensureRealDirectory,
     isUuid,
+    probeRealDirectory,
 } from './paths.js';
 
 export const SCHEMA_VERSION = 1;
@@ -108,6 +114,9 @@ const projectFile = (root, projectId) => projectFilePath(root, projectId, 'proje
 const profileFile = (root, projectId) => projectFilePath(root, projectId, 'profile.json');
 const chapterFile = (root, projectId, chapterId) =>
     containedPath(root, ['projects', projectId, 'chapters', `${chapterId}.md`]);
+const notesDir = (root, projectId) => containedPath(root, ['projects', projectId, 'notes']);
+const noteFile = (root, projectId, chapterId) =>
+    containedPath(root, ['projects', projectId, 'notes', `${chapterId}.md`]);
 
 function requireUuid(value) {
     if (!isUuid(value)) {
@@ -589,5 +598,99 @@ export async function writeProfile(root, projectId, body, expectedEtag) {
         await atomicWrite(profileFile(root, projectId), serialized);
 
         return { profile: { ...defaultProfile(), ...merged }, etag: hashContent(serialized) };
+    });
+}
+
+/* --- per-chapter notes (Phase 3 checkpoint 3) ------------------------------ */
+
+/**
+ * The bytes a note's revision is computed from.
+ *
+ * ⚠️ The ONE place absent and tampered are told apart for notes. An absent
+ * notes/ directory or an absent file is the ordinary state of a chapter that
+ * has never had a note, and reads as '' — the digest createChapter mints for
+ * an empty chapter, so "empty" has one etag everywhere. A symlink or non-file
+ * at either level is 404, never read through and never written over. A GET
+ * never creates notes/.
+ */
+async function readNotesBytes(root, projectId, chapterId) {
+    if (!(await probeRealDirectory(notesDir(root, projectId)))) {
+        return '';
+    }
+
+    const target = noteFile(root, projectId, chapterId);
+    let stats;
+
+    try {
+        stats = await fs.lstat(target);
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            return '';
+        }
+        throw error;
+    }
+
+    if (!stats.isFile()) {
+        throw new RequestError(404, 'not found');
+    }
+
+    return fs.readFile(target, 'utf8');
+}
+
+/**
+ * Read a chapter's notes. "Absent = empty" is scoped to the NOTE: the chapter
+ * itself must exist, or this is 404 like any other missing resource — the
+ * ancestry chain plus the chapter leaf collapse every missing or tampered case
+ * to 404 without a project load.
+ */
+export async function readNotes(root, projectId, chapterId) {
+    requireUuid(projectId);
+    requireUuid(chapterId);
+
+    await assertChapterAncestryReal(root, projectId);
+    await assertRealFile(chapterFile(root, projectId, chapterId));
+
+    const content = await readNotesBytes(root, projectId, chapterId);
+
+    return { id: chapterId, content, etag: hashContent(content) };
+}
+
+/**
+ * Replace a chapter's notes, as a compare-and-swap against the bytes on disk
+ * (absent counting as ''). Same discipline as writeChapter: validation outside
+ * the lock; ancestry, leaf, read, compare and write inside it.
+ *
+ * ⚠️ notes/ is created AFTER the compare, immediately before the write: a
+ * 412 or a rejected body must leave no directory behind, and atomicWrite puts
+ * its temp file in the target's own directory, so that directory has to exist
+ * right there and nowhere earlier.
+ */
+export async function writeNotes(root, projectId, chapterId, content, expectedEtag) {
+    requireUuid(projectId);
+    requireUuid(chapterId);
+
+    if (typeof content !== 'string') {
+        throw new RequestError(400, 'content must be a string');
+    }
+    if (Buffer.byteLength(content, 'utf8') > MAX_CHAPTER_BYTES) {
+        throw new RequestError(413, 'notes too large');
+    }
+
+    return withLock(`notes:${projectId}:${chapterId}`, async () => {
+        await assertChapterAncestryReal(root, projectId);
+        await assertRealFile(chapterFile(root, projectId, chapterId));
+
+        const current = await readNotesBytes(root, projectId, chapterId);
+
+        if (hashContent(current) !== expectedEtag) {
+            throw new RequestError(412, 'revision mismatch');
+        }
+
+        // The project directory was verified real by the ancestry call above,
+        // so this creates exactly one level under an already-trusted parent.
+        await ensureRealDirectory(notesDir(root, projectId));
+        await atomicWrite(noteFile(root, projectId, chapterId), content);
+
+        return { id: chapterId, etag: hashContent(content) };
     });
 }

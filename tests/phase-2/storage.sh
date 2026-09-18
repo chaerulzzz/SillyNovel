@@ -452,6 +452,132 @@ T_ONE=$(etag_of "$JAR_A" "$PURL"); sleep 1; T_TWO=$(etag_of "$JAR_A" "$PURL")
 check "repeated profile GET returns the same etag" "$([ -n "$T_ONE" ] && [ "$T_ONE" = "$T_TWO" ] && echo 1 || echo 0)"
 
 echo
+echo "== 9. per-chapter notes (Phase 3) =="
+
+put_cas() { put_profile "$@"; }            # the wrapper is generic: out url jar csrf etag-quoted json
+put_cas_file() { put_profile_file "$@"; }
+EMPTY_SHA='"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"'
+
+CODE=$(req "$R" POST "$API/projects/$PID/chapters" "$JAR_A" "$CSRF_A" '{"title":"Chapter two"}')
+CID2=$(jget id < "$R")
+check "second chapter -> 201 (code=$CODE)" "$([ "$CODE" = "201" ] && echo 1 || echo 0)"
+NURL="$API/projects/$PID/chapters/$CID/notes"
+NURL2="$API/projects/$PID/chapters/$CID2/notes"
+CH_TAG_BEFORE=$(etag_of "$JAR_A" "$API/projects/$PID/chapters/$CID")
+
+# --- first run: no notes/ directory, no file -----------------------------------
+CODE=$(req "$R" GET "$NURL" "$JAR_A" "$CSRF_A")
+check "GET notes on a note-less chapter -> 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+check "note-less chapter reads as empty content" "$([ "$(jget content < "$R")" = "" ] && echo 1 || echo 0)"
+N_DEFAULT=$(etag_of "$JAR_A" "$NURL")
+check "empty notes carry the digest of '' (the same etag createChapter mints)" "$([ "$N_DEFAULT" = "$EMPTY_SHA" ] && echo 1 || echo 0)"
+check "two note-less chapters share that etag" "$([ "$(etag_of "$JAR_A" "$NURL2")" = "$EMPTY_SHA" ] && echo 1 || echo 0)"
+
+# --- compare-and-swap ----------------------------------------------------------
+CODE=$(req "$R" PUT "$NURL" "$JAR_A" "$CSRF_A" '{"content":"a note"}')
+check "PUT notes without If-Match -> 428 (code=$CODE)" "$([ "$CODE" = "428" ] && echo 1 || echo 0)"
+CODE=$(put_cas "$R" "$NURL" "$JAR_A" "$CSRF_A" "$EMPTY_SHA" '{"content":"first note"}')
+check "first PUT with the empty digest creates notes/ -> 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+NTAG1=$(jget etag < "$R")
+check "saved notes etag differs from the empty digest" "$([ -n "$NTAG1" ] && [ "\"$NTAG1\"" != "$EMPTY_SHA" ] && echo 1 || echo 0)"
+req "$R" GET "$NURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "GET returns the saved note" "$([ "$(jget content < "$R")" = "first note" ] && echo 1 || echo 0)"
+CODE=$(put_cas "$R" "$NURL" "$JAR_A" "$CSRF_A" "$EMPTY_SHA" '{"content":"STALE"}')
+check "stale notes etag -> 412 (code=$CODE)" "$([ "$CODE" = "412" ] && echo 1 || echo 0)"
+req "$R" GET "$NURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "rejected notes write changed nothing" "$([ "$(jget content < "$R")" = "first note" ] && echo 1 || echo 0)"
+
+put_cas "$BODY_DIR/na.out" "$NURL" "$JAR_A" "$CSRF_A" "\"$NTAG1\"" '{"content":"writer A"}' > "$BODY_DIR/na.code" &
+put_cas "$BODY_DIR/nb.out" "$NURL" "$JAR_A" "$CSRF_A" "\"$NTAG1\"" '{"content":"writer B"}' > "$BODY_DIR/nb.code" &
+wait
+NCA=$(cat "$BODY_DIR/na.code"); NCB=$(cat "$BODY_DIR/nb.code")
+check "parallel same-etag notes PUTs: exactly one 200 (codes=$NCA,$NCB)" "$([ "$NCA$NCB" = "200412" ] || [ "$NCA$NCB" = "412200" ] && echo 1 || echo 0)"
+req "$R" GET "$NURL" "$JAR_A" "$CSRF_A" > /dev/null
+NWINNER=$( [ "$NCA" = "200" ] && echo "writer A" || echo "writer B" )
+check "notes hold the winner's bytes" "$([ "$(jget content < "$R")" = "$NWINNER" ] && echo 1 || echo 0)"
+NTAG2=$(etag_of "$JAR_A" "$NURL")
+CODE=$(put_cas "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG2" "{\"content\":\"$NWINNER\"}")
+check "identical notes PUT returns the same etag (code=$CODE)" "$([ "$CODE" = "200" ] && [ "\"$(jget etag < "$R")\"" = "$NTAG2" ] && echo 1 || echo 0)"
+
+for pair in 'wildcard:*' 'weak:W/"'"${NTAG2//\"/}"'"' 'multi:'"$NTAG2"', '"$NTAG2" 'unquoted:'"${NTAG2//\"/}" 'malformed:"nothex"'; do
+  label="${pair%%:*}"; value="${pair#*:}"
+  CODE=$(put_cas "$R" "$NURL" "$JAR_A" "$CSRF_A" "$value" '{"content":"BAD IF-MATCH"}')
+  check "If-Match $label rejected on notes (code=$CODE)" "$([ "$CODE" != "200" ] && echo 1 || echo 0)"
+done
+req "$R" GET "$NURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "no rejected notes If-Match write landed" "$([ "$(jget content < "$R")" = "$NWINNER" ] && echo 1 || echo 0)"
+
+# --- body contract and byte cap (section 6's fixtures) ------------------------
+CODE=$(put_cas "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG2" '{"content":12}')
+check "non-string notes -> 400 (code=$CODE)" "$([ "$CODE" = "400" ] && echo 1 || echo 0)"
+CODE=$(put_cas "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG2" '{}')
+check "missing notes content -> 400 (code=$CODE)" "$([ "$CODE" = "400" ] && echo 1 || echo 0)"
+CODE=$(put_cas_file "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG2" "$BODY_DIR/fixture.json")
+req "$R" GET "$NURL" "$JAR_A" "$CSRF_A" > /dev/null
+MATCH=$(python3 -c "
+import json
+sent = json.load(open('$BODY_DIR/fixture.json'))['content']
+got  = json.load(open('$R'))['content']
+print(1 if repr(sent) == repr(got) else 0)")
+check "unicode/whitespace notes round-trip byte-identical (code=$CODE)" "$([ "$CODE" = "200" ] && [ "$MATCH" = "1" ] && echo 1 || echo 0)"
+NTAG3=$(etag_of "$JAR_A" "$NURL")
+CODE=$(put_cas_file "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG3" "$BODY_DIR/over_cap.json")
+check "notes just over the byte cap -> 413 (code=$CODE)" "$([ "$CODE" = "413" ] && grep -q 'notes too large' "$R" && echo 1 || echo 0)"
+CODE=$(put_cas_file "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG3" "$BODY_DIR/multibyte_over_cap.json")
+check "multi-byte notes over the BYTE cap -> 413 (code=$CODE)" "$([ "$CODE" = "413" ] && echo 1 || echo 0)"
+check "rejected oversize notes changed nothing" "$([ "$(etag_of "$JAR_A" "$NURL")" = "$NTAG3" ] && echo 1 || echo 0)"
+CODE=$(put_cas_file "$R" "$NURL" "$JAR_A" "$CSRF_A" "$NTAG3" "$BODY_DIR/under_cap.json")
+check "notes just under the byte cap -> 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+NTAG4=$(jget etag < "$R")
+
+# --- the chapter must exist: absent-equals-empty never applies to the chapter --
+CODE=$(req "$R" GET "$API/projects/$PID/chapters/$MISSING_ID/notes" "$JAR_A" "$CSRF_A")
+check "notes of a nonexistent chapter: GET -> 404, not empty (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CODE=$(put_cas "$R" "$API/projects/$PID/chapters/$MISSING_ID/notes" "$JAR_A" "$CSRF_A" "$EMPTY_SHA" '{"content":"ghost"}')
+check "notes of a nonexistent chapter: PUT -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CODE=$(req "$R" GET "$API/projects/$GHOST/chapters/$CID/notes" "$JAR_A" "$CSRF_A")
+check "notes under a nonexistent project: GET -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CODE=$(put_cas "$R" "$API/projects/$GHOST/chapters/$CID/notes" "$JAR_A" "$CSRF_A" "$EMPTY_SHA" '{"content":"ghost"}')
+check "notes under a nonexistent project: PUT -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+
+# --- hostile identifiers on BOTH segments ------------------------------------
+for hostile in '..%2F..%2Fetc%2Fpasswd' '%2Fetc%2Fpasswd' '%00' 'aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee' "$CID-evil" "$(printf 'a%.0s' $(seq 1 4096))"; do
+  CODE=$(req "$R" GET "$API/projects/$hostile/chapters/$CID/notes" "$JAR_A" "$CSRF_A")
+  LEAK=$(grep -qiE '/home/node|/data/|\.sillynovel' "$R" && echo 1 || echo 0)
+  check "hostile project id on notes rejected (code=$CODE)" "$([ "$CODE" != "200" ] && [ "$LEAK" = "0" ] && echo 1 || echo 0)"
+  CODE=$(req "$R" GET "$API/projects/$PID/chapters/$hostile/notes" "$JAR_A" "$CSRF_A")
+  LEAK=$(grep -qiE '/home/node|/data/|\.sillynovel' "$R" && echo 1 || echo 0)
+  check "hostile chapter id on notes rejected (code=$CODE)" "$([ "$CODE" != "200" ] && [ "$LEAK" = "0" ] && echo 1 || echo 0)"
+done
+
+# --- cross-user isolation ------------------------------------------------------
+CODE=$(req "$R" GET "$NURL" "$JAR_B" "$CSRF_B")
+check "user B cannot read A's notes (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CODE=$(put_cas "$R" "$NURL" "$JAR_B" "$CSRF_B" "\"$NTAG4\"" '{"content":"B WAS HERE"}')
+check "user B cannot write A's notes (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+check "A's notes unchanged after B's attempts" "$([ "$(etag_of "$JAR_A" "$NURL")" = "\"$NTAG4\"" ] && echo 1 || echo 0)"
+
+# --- notes never touch the chapter or the listing ------------------------------
+check "chapter content untouched by notes writes" "$([ "$(etag_of "$JAR_A" "$API/projects/$PID/chapters/$CID")" = "$CH_TAG_BEFORE" ] && echo 1 || echo 0)"
+req "$R" GET "$API/projects/$PID" "$JAR_A" "$CSRF_A" > /dev/null
+check "notes/ invisible to the chapter listing" "$([ "$(python3 -c "import json;print(len(json.load(open('$R'))['chapters']))")" = "2" ] && echo 1 || echo 0)"
+
+# --- reads never write ---------------------------------------------------------
+T1=$(etag_of "$JAR_A" "$NURL2"); sleep 1; T2=$(etag_of "$JAR_A" "$NURL2")
+check "repeated GET on a note-less chapter stays the empty digest" "$([ "$T1" = "$EMPTY_SHA" ] && [ "$T2" = "$EMPTY_SHA" ] && echo 1 || echo 0)"
+
+# --- the race: two chapters' FIRST notes saves in one fresh project ------------
+CODE=$(req "$R" POST "$API/projects" "$JAR_A" "$CSRF_A" '{"title":"Race project"}')
+PID3=$(jget id < "$R")
+req "$R" POST "$API/projects/$PID3/chapters" "$JAR_A" "$CSRF_A" '{"title":"R1"}' > /dev/null; RC1=$(jget id < "$R")
+req "$R" POST "$API/projects/$PID3/chapters" "$JAR_A" "$CSRF_A" '{"title":"R2"}' > /dev/null; RC2=$(jget id < "$R")
+put_cas "$BODY_DIR/r1.out" "$API/projects/$PID3/chapters/$RC1/notes" "$JAR_A" "$CSRF_A" "$EMPTY_SHA" '{"content":"r1"}' > "$BODY_DIR/r1.code" &
+put_cas "$BODY_DIR/r2.out" "$API/projects/$PID3/chapters/$RC2/notes" "$JAR_A" "$CSRF_A" "$EMPTY_SHA" '{"content":"r2"}' > "$BODY_DIR/r2.code" &
+wait
+RC=$(cat "$BODY_DIR/r1.code")$(cat "$BODY_DIR/r2.code")
+check "two first notes saves racing to create notes/ -> both 200 (codes=$RC)" "$([ "$RC" = "200200" ] && echo 1 || echo 0)"
+
+echo
 echo "PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then
   printf 'FAILED: %s\n' "${FAILURES[@]}"

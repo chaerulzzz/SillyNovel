@@ -67,3 +67,28 @@ sees it.
 **Manual, not automated (destructive):** replace `profile.json` with a symlink
 and confirm GET and PUT both answer 404 — sleep at least 2 s after the swap,
 virtiofs caches directory metadata for about a second.
+
+## Per-chapter notes — `tests/phase-2/storage.sh` section 9
+
+The notes routes (`GET`/`PUT /projects/:id/chapters/:id/notes`) are covered in
+section 9 of the same suite: the first-run empty digest (identical across two
+note-less chapters, and equal to what `createChapter` mints), compare-and-swap
+with two parallel writers, every If-Match rejection, the body contract and byte
+caps, **the chapter must exist** (absent-equals-empty never applies to the
+chapter itself), hostile ids on both path segments, cross-user isolation, the
+chapter and the listing untouched by notes writes, read stability, and the race
+of two chapters' first saves creating `notes/` at once — both must answer 200.
+That last case is a probe, not a proof: two background curls do not guarantee
+the two `mkdir`s overlapped on a given run; the `EEXIST` branch in
+`ensureRealDirectory` is the structural fix.
+
+**Manual, not automated (destructive), sleep ≥ 2 s after every swap:**
+
+1. `notes/` swapped for a symlink to a decoy directory holding `<cid>.md` with
+   the text `DECOY` → GET 404 (never the decoy), PUT 404, and nothing written
+   into the decoy.
+2. `notes/<cid>.md` replaced by a symlink to `/etc/passwd` → GET 404 (never read
+   through), PUT 404, and the target untouched.
+3. `notes/` replaced by a **regular file** → GET 404, **not** 200 with empty
+   content; PUT 404. This is the case that separates "absent, fine" from
+   "tampered, refuse".
