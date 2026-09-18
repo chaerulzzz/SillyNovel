@@ -5,6 +5,7 @@
  *
  *   <canonical user root>/sillynovel/projects/<uuid>/
  *   ├── project.json          schemaVersion, id, title, revision, chapters[]
+ *   ├── profile.json          the Writing Profile (Phase 3), seven string fields
  *   └── chapters/<uuid>.md    pure prose, nothing else
  *
  * ONE FILE PER CHAPTER. The revision IS a SHA-256 digest of the chapter's
@@ -32,6 +33,22 @@ export const SCHEMA_VERSION = 1;
 
 /** Generous for a single chapter (~170k words) and still bounded. */
 export const MAX_CHAPTER_BYTES = 1024 * 1024;
+
+/**
+ * The Writing Profile: how the prose should read (PLAN.md Phase 3). Seven
+ * string fields, a flat record — what a textarea per field needs, and nothing
+ * that pre-commits a structure the prompt renderer does not use.
+ */
+export const PROFILE_FIELDS = ['voice', 'genre', 'pov', 'tense', 'styleInstructions', 'proseExamples', 'boundaries'];
+
+/**
+ * Per-field caps bind first; the whole-file cap is a backstop for unknown keys
+ * a newer client may carry. 96 KiB > 6 × 8 KiB + 32 KiB, so an author who fills
+ * every field to its limit still gets the field-level message, not the file one.
+ */
+export const MAX_PROFILE_FIELD_BYTES = 8 * 1024;
+export const MAX_PROFILE_EXAMPLES_BYTES = 32 * 1024;
+export const MAX_PROFILE_BYTES = 96 * 1024;
 
 const DEFAULT_PROJECT_TITLE = 'Untitled project';
 const DEFAULT_CHAPTER_TITLE = 'Untitled chapter';
@@ -85,6 +102,10 @@ function sanitizeTitle(value, fallback) {
 const projectsDir = (root) => containedPath(root, ['projects']);
 const projectDir = (root, projectId) => containedPath(root, ['projects', projectId]);
 const chaptersDir = (root, projectId) => containedPath(root, ['projects', projectId, 'chapters']);
+// `name` is always a literal from a caller in this file — never request data.
+const projectFilePath = (root, projectId, name) => containedPath(root, ['projects', projectId, name]);
+const projectFile = (root, projectId) => projectFilePath(root, projectId, 'project.json');
+const profileFile = (root, projectId) => projectFilePath(root, projectId, 'profile.json');
 const chapterFile = (root, projectId, chapterId) =>
     containedPath(root, ['projects', projectId, 'chapters', `${chapterId}.md`]);
 
@@ -188,7 +209,7 @@ async function loadProject(root, projectId) {
         return null;
     }
 
-    const metadata = await readJson(containedPath(root, ['projects', projectId, 'project.json']))
+    const metadata = await readJson(projectFile(root, projectId))
         .catch(() => null);
 
     // A project directory without readable metadata is treated as an incomplete
@@ -235,12 +256,17 @@ async function loadProject(root, projectId) {
  * so a client cannot use the distinction to probe what exists.
  */
 async function assertChapterAncestryReal(root, projectId) {
+    await assertProjectAncestryReal(root, projectId);
+    await assertRealDirectory(chaptersDir(root, projectId));
+}
+
+/** The first two links of that chain, for files that live beside project.json. */
+async function assertProjectAncestryReal(root, projectId) {
     const projectsExist = await checkRealDirectory(projectsDir(root));
     if (!projectsExist) {
         throw new RequestError(404, 'not found');
     }
     await assertRealDirectory(projectDir(root, projectId));
-    await assertRealDirectory(chaptersDir(root, projectId));
 }
 
 export async function listProjects(root) {
@@ -300,8 +326,7 @@ export async function createProject(root, title) {
         createdAt: new Date().toISOString(),
     };
 
-    await atomicWrite(containedPath(root, ['projects', id, 'project.json']),
-        JSON.stringify(metadata, null, 2));
+    await atomicWrite(projectFile(root, id), JSON.stringify(metadata, null, 2));
 
     return { id, title: metadata.title, chapters: [] };
 }
@@ -352,8 +377,7 @@ export async function createChapter(root, projectId, title) {
             updatedAt: new Date().toISOString(),
         };
 
-        await atomicWrite(containedPath(root, ['projects', projectId, 'project.json']),
-            JSON.stringify(metadata, null, 2));
+        await atomicWrite(projectFile(root, projectId), JSON.stringify(metadata, null, 2));
 
         return { id: chapterId, title: chapters.at(-1).title, content: '', etag: hashContent('') };
     });
@@ -409,5 +433,161 @@ export async function writeChapter(root, projectId, chapterId, content, expected
         // Identical bytes yield an identical digest. That is correct — nothing
         // changed — so callers must not expect a revision to always advance.
         return { id: chapterId, etag: hashContent(content) };
+    });
+}
+
+/* --- the Writing Profile (Phase 3) ---------------------------------------- */
+
+export function defaultProfile() {
+    return Object.fromEntries([['schemaVersion', SCHEMA_VERSION], ...PROFILE_FIELDS.map((field) => [field, ''])]);
+}
+
+/**
+ * The one serialization of a profile, so identical content always hashes the
+ * same: schemaVersion first, the known fields in their fixed order, then any
+ * unknown keys in the order they were found.
+ */
+export function serializeProfile(profile) {
+    const ordered = { schemaVersion: SCHEMA_VERSION };
+    for (const field of PROFILE_FIELDS) {
+        ordered[field] = profile[field];
+    }
+    for (const [key, value] of Object.entries(profile)) {
+        if (!(key in ordered)) {
+            ordered[key] = value;
+        }
+    }
+    return JSON.stringify(ordered, null, 2);
+}
+
+function parseProfile(raw) {
+    try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('not an object');
+        }
+        return parsed;
+    } catch {
+        throw new RequestError(500, 'corrupt profile');
+    }
+}
+
+/**
+ * The bytes the profile's revision is computed from.
+ *
+ * ⚠️ This is the ONE place "absent" and "tampered" are told apart, and they
+ * must be. An absent file is the ordinary first run and reads as the canonical
+ * default — same bytes, same digest, on every project that has never saved a
+ * profile, so the client's first PUT carries an If-Match the CAS below will
+ * accept with no special case on either side. A symlink or non-file at the
+ * leaf is a 404 like a tampered chapter: never read through, never written
+ * over.
+ */
+async function readProfileBytes(root, projectId) {
+    const target = profileFile(root, projectId);
+    let stats;
+
+    try {
+        stats = await fs.lstat(target);
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            return { raw: serializeProfile(defaultProfile()), exists: false };
+        }
+        throw error;
+    }
+
+    if (!stats.isFile()) {
+        throw new RequestError(404, 'not found');
+    }
+
+    return { raw: await fs.readFile(target, 'utf8'), exists: true };
+}
+
+/**
+ * Read the profile. Absent → 200 with the default, never 404: on this route 404
+ * means the project is missing or tampered, nothing else, so the client never
+ * has to guess between "no profile yet" and "project gone".
+ */
+export async function readProfile(root, projectId) {
+    requireUuid(projectId);
+
+    if (!(await loadProject(root, projectId))) {
+        throw new RequestError(404, 'not found');
+    }
+    await assertProjectAncestryReal(root, projectId);
+
+    const { raw } = await readProfileBytes(root, projectId);
+
+    return { profile: { ...defaultProfile(), ...parseProfile(raw) }, etag: hashContent(raw) };
+}
+
+function validateProfileBody(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new RequestError(400, 'profile must be an object');
+    }
+    if ('schemaVersion' in body && body.schemaVersion !== SCHEMA_VERSION) {
+        // A newer client's document is refused, not silently downgraded.
+        throw new RequestError(400, 'unsupported schema version');
+    }
+    for (const field of PROFILE_FIELDS) {
+        if (!(field in body)) {
+            continue;
+        }
+        if (typeof body[field] !== 'string') {
+            throw new RequestError(400, 'invalid profile field');
+        }
+        const cap = field === 'proseExamples' ? MAX_PROFILE_EXAMPLES_BYTES : MAX_PROFILE_FIELD_BYTES;
+        if (Buffer.byteLength(body[field], 'utf8') > cap) {
+            throw new RequestError(413, 'profile field too large');
+        }
+    }
+}
+
+/**
+ * Replace the profile, as a compare-and-swap against the bytes on disk.
+ *
+ * Semantics, precisely: every known field is replaced (absent = empty string);
+ * unknown top-level keys already in the file are PRESERVED unless the body
+ * carries them, in which case the body wins; schemaVersion is always stamped.
+ * The server owns preservation — the CAS reads the existing bytes under the
+ * lock anyway, so the merge is free, and it holds for every client, curl
+ * included. (Spread creates own data properties, so a `"__proto__"` key from
+ * JSON.parse lands as a plain key and cannot touch the prototype.)
+ *
+ * Locked on `project:<id>`, the key createChapter holds while rewriting
+ * project.json — a different file, but the conservative choice costs a few
+ * milliseconds once per chapter creation and gives Phase 5's rename and reorder
+ * one key to reason about.
+ */
+export async function writeProfile(root, projectId, body, expectedEtag) {
+    requireUuid(projectId);
+    validateProfileBody(body);
+
+    return withLock(`project:${projectId}`, async () => {
+        if (!(await loadProject(root, projectId))) {
+            throw new RequestError(404, 'not found');
+        }
+        await assertProjectAncestryReal(root, projectId);
+
+        const { raw } = await readProfileBytes(root, projectId);
+
+        if (hashContent(raw) !== expectedEtag) {
+            throw new RequestError(412, 'revision mismatch');
+        }
+
+        const existing = parseProfile(raw);
+        const known = Object.fromEntries(
+            PROFILE_FIELDS.map((field) => [field, typeof body[field] === 'string' ? body[field] : '']),
+        );
+        const merged = { ...existing, ...body, ...known, schemaVersion: SCHEMA_VERSION };
+        const serialized = serializeProfile(merged);
+
+        if (Buffer.byteLength(serialized, 'utf8') > MAX_PROFILE_BYTES) {
+            throw new RequestError(413, 'profile too large');
+        }
+
+        await atomicWrite(profileFile(root, projectId), serialized);
+
+        return { profile: { ...defaultProfile(), ...merged }, etag: hashContent(serialized) };
     });
 }

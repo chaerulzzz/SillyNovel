@@ -300,6 +300,158 @@ AFTER=$(cat "$R")
 check "repeated project GET is stable" "$([ "$BEFORE" != "" ] && [ "${BEFORE#*\{}" = "${AFTER#*\{}" ] && echo 1 || echo 0)"
 
 echo
+echo "== 8. the Writing Profile (Phase 3) =="
+
+# A nested-key reader for {profile: {...}} bodies; jget reads the top level only.
+pget() { python3 -c "import sys,json;print(json.load(sys.stdin).get('profile',{}).get('$1',''))"; }
+put_profile() { # out url jar csrf etag-quoted json
+  curl -s -o "$1" -w "%{http_code}" -b "$3" -H "X-CSRF-Token: $4" -H "Content-Type: application/json" \
+    -H "If-Match: $5" -X PUT "$2" --data-binary "$6"
+}
+put_profile_file() { # out url jar csrf etag-quoted file
+  curl -s -o "$1" -w "%{http_code}" -b "$3" -H "X-CSRF-Token: $4" -H "Content-Type: application/json" \
+    -H "If-Match: $5" -X PUT "$2" --data-binary "@$6"
+}
+
+CODE=$(req "$R" POST "$API/projects" "$JAR_A" "$CSRF_A" '{"title":"Second project"}')
+PID2=$(jget id < "$R")
+check "second project -> 201 (code=$CODE)" "$([ "$CODE" = "201" ] && echo 1 || echo 0)"
+
+PURL="$API/projects/$PID/profile"
+PURL2="$API/projects/$PID2/profile"
+
+# --- first run: absent file reads as the canonical default -------------------
+CODE=$(req "$R" GET "$PURL" "$JAR_A" "$CSRF_A")
+check "GET profile on a fresh project -> 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+EMPTY=$(python3 -c "
+import json; p=json.load(open('$R'))['profile']
+fields=['voice','genre','pov','tense','styleInstructions','proseExamples','boundaries']
+print(1 if p.get('schemaVersion')==1 and all(p.get(f)=='' for f in fields) else 0)")
+check "fresh profile has schemaVersion 1 and seven empty fields" "$EMPTY"
+DEFAULT_TAG=$(etag_of "$JAR_A" "$PURL")
+DEFAULT_TAG2=$(etag_of "$JAR_A" "$PURL2")
+check "two fresh projects share the canonical default etag" "$([ -n "$DEFAULT_TAG" ] && [ "$DEFAULT_TAG" = "$DEFAULT_TAG2" ] && echo 1 || echo 0)"
+
+# --- compare-and-swap ----------------------------------------------------------
+CODE=$(req "$R" PUT "$PURL" "$JAR_A" "$CSRF_A" '{"profile":{"voice":"dry"}}')
+check "PUT profile without If-Match -> 428 (code=$CODE)" "$([ "$CODE" = "428" ] && echo 1 || echo 0)"
+
+CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "$DEFAULT_TAG" '{"profile":{"voice":"dry, close third"}}')
+check "first PUT with the default etag -> 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+TAG1=$(jget etag < "$R")
+check "saved etag differs from the default" "$([ -n "$TAG1" ] && [ "\"$TAG1\"" != "$DEFAULT_TAG" ] && echo 1 || echo 0)"
+
+python3 -c "
+import json
+json.dump({'profile': {'voice': '  leading\n\ntabs\ttoo\n日本語 café 🌒 ends with space  ', 'genre': 'gothic'}},
+          open('$BODY_DIR/pfixture.json', 'w'))
+"
+CODE=$(put_profile_file "$R" "$PURL" "$JAR_A" "$CSRF_A" "\"$TAG1\"" "$BODY_DIR/pfixture.json")
+TAG2=$(jget etag < "$R")
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+MATCH=$(python3 -c "
+import json
+sent = json.load(open('$BODY_DIR/pfixture.json'))['profile']['voice']
+got  = json.load(open('$R'))['profile']['voice']
+print(1 if repr(sent) == repr(got) else 0)")
+check "unicode/whitespace profile round-trip byte-identical (code=$CODE)" "$([ "$CODE" = "200" ] && [ "$MATCH" = "1" ] && echo 1 || echo 0)"
+
+CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "$DEFAULT_TAG" '{"profile":{"voice":"STALE WRITE"}}')
+check "stale etag -> 412 (code=$CODE)" "$([ "$CODE" = "412" ] && echo 1 || echo 0)"
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "rejected write changed nothing" "$([ "$(pget voice < "$R" | head -c 5)" != "STALE" ] && echo 1 || echo 0)"
+
+# two writers, one etag: exactly one may win
+put_profile "$BODY_DIR/pa.out" "$PURL" "$JAR_A" "$CSRF_A" "\"$TAG2\"" '{"profile":{"voice":"writer A"}}' > "$BODY_DIR/pa.code" &
+put_profile "$BODY_DIR/pb.out" "$PURL" "$JAR_A" "$CSRF_A" "\"$TAG2\"" '{"profile":{"voice":"writer B"}}' > "$BODY_DIR/pb.code" &
+wait
+CA=$(cat "$BODY_DIR/pa.code"); CB=$(cat "$BODY_DIR/pb.code")
+check "parallel same-etag PUTs: exactly one 200 (codes=$CA,$CB)" "$([ "$CA$CB" = "200412" ] || [ "$CA$CB" = "412200" ] && echo 1 || echo 0)"
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+WINNER=$( [ "$CA" = "200" ] && echo "writer A" || echo "writer B" )
+check "profile holds the winner's bytes" "$([ "$(pget voice < "$R")" = "$WINNER" ] && echo 1 || echo 0)"
+TAG3=$(etag_of "$JAR_A" "$PURL")
+
+CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "{\"profile\":{\"voice\":\"$WINNER\"}}")
+check "identical PUT returns the same etag (code=$CODE)" "$([ "$CODE" = "200" ] && [ "\"$(jget etag < "$R")\"" = "$TAG3" ] && echo 1 || echo 0)"
+
+for pair in 'wildcard:*' 'weak:W/"'"${TAG3//\"/}"'"' 'multi:'"$TAG3"', '"$TAG3" 'unquoted:'"${TAG3//\"/}" 'malformed:"nothex"'; do
+  label="${pair%%:*}"; value="${pair#*:}"
+  CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "$value" '{"profile":{"voice":"BAD IF-MATCH"}}')
+  check "If-Match $label rejected on profile (code=$CODE)" "$([ "$CODE" != "200" ] && echo 1 || echo 0)"
+done
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "no rejected If-Match write landed" "$([ "$(pget voice < "$R")" = "$WINNER" ] && echo 1 || echo 0)"
+
+# --- payload contracts ---------------------------------------------------------
+for bad in '{"profile":"x"}' '{"profile":[]}' '{}' '{"profile":{"voice":12}}' '{"profile":{"schemaVersion":2}}'; do
+  CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "$bad")
+  check "invalid body $bad -> 400 (code=$CODE)" "$([ "$CODE" = "400" ] && echo 1 || echo 0)"
+done
+
+python3 -c "
+import json
+json.dump({'profile': {'voice': 'a' * 8193}}, open('$BODY_DIR/p_over.json', 'w'))
+json.dump({'profile': {'voice': '日' * 3000}}, open('$BODY_DIR/p_multi.json', 'w'))   # 9,000 bytes, 3,000 chars
+json.dump({'profile': {'proseExamples': 'b' * (32 * 1024 - 10)}}, open('$BODY_DIR/p_under.json', 'w'))
+json.dump({'profile': {'proseExamples': 'b' * (32 * 1024 + 10)}}, open('$BODY_DIR/p_ex_over.json', 'w'))
+json.dump({'profile': {'futureKey': 'z' * (100 * 1024)}}, open('$BODY_DIR/p_total.json', 'w'))
+"
+CODE=$(put_profile_file "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "$BODY_DIR/p_over.json")
+check "field one byte over 8 KiB -> 413 (code=$CODE)" "$([ "$CODE" = "413" ] && echo 1 || echo 0)"
+CODE=$(put_profile_file "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "$BODY_DIR/p_multi.json")
+check "multi-byte field over the BYTE cap (3,000 chars) -> 413 (code=$CODE)" "$([ "$CODE" = "413" ] && echo 1 || echo 0)"
+CODE=$(put_profile_file "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "$BODY_DIR/p_ex_over.json")
+check "prose examples over 32 KiB -> 413 (code=$CODE)" "$([ "$CODE" = "413" ] && echo 1 || echo 0)"
+CODE=$(put_profile_file "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "$BODY_DIR/p_total.json")
+check "unknown key of 100 KiB -> 413 profile too large (code=$CODE)" "$([ "$CODE" = "413" ] && grep -q 'profile too large' "$R" && echo 1 || echo 0)"
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "rejected oversize writes changed nothing" "$([ "$(pget voice < "$R")" = "$WINNER" ] && echo 1 || echo 0)"
+CODE=$(put_profile_file "$R" "$PURL" "$JAR_A" "$CSRF_A" "$TAG3" "$BODY_DIR/p_under.json")
+check "prose examples just under 32 KiB -> 200 (code=$CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+TAG4=$(jget etag < "$R")
+
+# --- unknown-field preservation, owned by the server ---------------------------
+CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "\"$TAG4\"" '{"profile":{"voice":"kept","futureKey":{"a":1}}}')
+TAG5=$(jget etag < "$R")
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "unknown key written is returned (code=$CODE)" "$([ "$(python3 -c "import json;print(json.load(open('$R'))['profile'].get('futureKey',{}).get('a'))")" = "1" ] && echo 1 || echo 0)"
+CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "\"$TAG5\"" '{"profile":{"voice":"kept again"}}')
+TAG6=$(jget etag < "$R")
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "unknown key SURVIVES a PUT that omits it (code=$CODE)" "$([ "$(python3 -c "import json;print(json.load(open('$R'))['profile'].get('futureKey',{}).get('a'))")" = "1" ] && echo 1 || echo 0)"
+check "prose examples were REPLACED by that PUT (absent = empty)" "$([ "$(pget proseExamples < "$R")" = "" ] && echo 1 || echo 0)"
+CODE=$(put_profile "$R" "$PURL" "$JAR_A" "$CSRF_A" "\"$TAG6\"" '{"profile":{"voice":"kept","futureKey":"changed"}}')
+TAG7=$(jget etag < "$R")
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "unknown key in the body wins over the file (code=$CODE)" "$([ "$(pget futureKey < "$R")" = "changed" ] && echo 1 || echo 0)"
+
+# --- hostile identifiers on the new path ---------------------------------------
+for hostile in '..%2F..%2Fetc%2Fpasswd' '%2Fetc%2Fpasswd' '%00' 'aaaaaaaa-bbbb-1ccc-8ddd-eeeeeeeeeeee' "$PID-evil" "$(printf 'a%.0s' $(seq 1 4096))"; do
+  CODE=$(req "$R" GET "$API/projects/$hostile/profile" "$JAR_A" "$CSRF_A")
+  LEAK=$(grep -qiE '/home/node|/data/|\.sillynovel' "$R" && echo 1 || echo 0)
+  check "hostile project id on profile rejected (code=$CODE)" "$([ "$CODE" != "200" ] && echo 1 || echo 0)"
+  check "hostile profile response discloses no path" "$([ "$LEAK" = "0" ] && echo 1 || echo 0)"
+done
+GHOST="123e4567-e89b-42d3-a456-426614174000"
+CODE=$(req "$R" GET "$API/projects/$GHOST/profile" "$JAR_A" "$CSRF_A")
+check "well-formed nonexistent project: GET profile -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CODE=$(put_profile "$R" "$API/projects/$GHOST/profile" "$JAR_A" "$CSRF_A" "$DEFAULT_TAG" '{"profile":{"voice":"ghost"}}')
+check "well-formed nonexistent project: PUT profile -> 404 (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+
+# --- cross-user isolation ------------------------------------------------------
+CODE=$(req "$R" GET "$PURL" "$JAR_B" "$CSRF_B")
+check "user B cannot read A's profile (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+CODE=$(put_profile "$R" "$PURL" "$JAR_B" "$CSRF_B" "\"$TAG7\"" '{"profile":{"voice":"B WAS HERE"}}')
+check "user B cannot write A's profile (code=$CODE)" "$([ "$CODE" = "404" ] && echo 1 || echo 0)"
+req "$R" GET "$PURL" "$JAR_A" "$CSRF_A" > /dev/null
+check "A's profile unchanged after B's attempts" "$([ "$(pget voice < "$R")" = "kept" ] && echo 1 || echo 0)"
+
+# --- reads never write ---------------------------------------------------------
+T_ONE=$(etag_of "$JAR_A" "$PURL"); sleep 1; T_TWO=$(etag_of "$JAR_A" "$PURL")
+check "repeated profile GET returns the same etag" "$([ -n "$T_ONE" ] && [ "$T_ONE" = "$T_TWO" ] && echo 1 || echo 0)"
+
+echo
 echo "PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then
   printf 'FAILED: %s\n' "${FAILURES[@]}"
