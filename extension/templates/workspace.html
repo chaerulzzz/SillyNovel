@@ -86,8 +86,21 @@
         <section class="sillynovel-inspector" aria-label="Context Inspector">
             <button type="button" class="sillynovel-inspector-toggle" aria-expanded="false">Context Inspector</button>
             <div class="sillynovel-inspector-body" hidden>
-                <p class="sillynovel-inspector-note">Prompt blocks are labeled from the start. Contents arrive in checkpoint 9; block order is a tunable, not a decision.</p>
+                <p class="sillynovel-inspector-note"></p>
+                <div class="sillynovel-inspector-controls">
+                    <button type="button" class="sillynovel-inspector-refresh">Refresh</button>
+                    <button type="button" class="sillynovel-inspector-copy">Copy prompt</button>
+                    <span class="sillynovel-inspector-status" role="status" hidden></span>
+                </div>
+                <p class="sillynovel-inspector-stale" hidden>The chapter changed after this was built, so it is no longer the prompt Continue would send. Refresh to rebuild.</p>
+                <p class="sillynovel-inspector-empty">Nothing built yet. Refresh builds the prompt from what the editor holds right now, without sending anything.</p>
+                <p class="sillynovel-inspector-refusal" role="status" hidden></p>
+                <ul class="sillynovel-inspector-figures" hidden></ul>
+                <p class="sillynovel-inspector-caveat" hidden></p>
+                <h6 class="sillynovel-inspector-heading" data-part="excluded" hidden>Not sent</h6>
                 <ul class="sillynovel-inspector-blocks"></ul>
+                <h6 class="sillynovel-inspector-heading" data-part="wire" hidden>Handed to SillyTavern, in this order</h6>
+                <ol class="sillynovel-inspector-wire"></ol>
             </div>
         </section>
     </div>

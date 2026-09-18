@@ -31,6 +31,7 @@ import {
     PROMPT_BLOCKS,
     buildContinuePrompt,
     cancelGeneration,
+    expandForDisplay,
     getActiveGeneration,
     needsPreflight,
     runContinue,
@@ -641,6 +642,7 @@ function renderWorkspaceContent(panel, workspace) {
     // generation rather than reset, because one may still be running — started
     // in another chapter, or before a close and reopen.
     clearSuggestion(panel);
+    clearInspection(panel);
     renderTrimNote(panel, null);
     // Cleared before the repaint, not after: renderActionBar only WRITES the
     // note while something is running, so a message left over from the previous
@@ -656,34 +658,6 @@ function renderWorkspaceContent(panel, workspace) {
         setSaveStatus(panel, 'idle');
     } else {
         renderHaltStatus(panel);
-    }
-}
-
-/** Fill the Inspector with §3's labels and wire its disclosure. */
-function renderInspector(panel) {
-    const list = panel.querySelector('.sillynovel-inspector-blocks');
-    const toggle = panel.querySelector('.sillynovel-inspector-toggle');
-    const body = panel.querySelector('.sillynovel-inspector-body');
-
-    if (list) {
-        list.replaceChildren(...PROMPT_BLOCKS.map((name) => {
-            const item = document.createElement('li');
-            item.textContent = `[${name}]`;
-            return item;
-        }));
-    }
-
-    if (toggle && body) {
-        // Set explicitly rather than relying on the template's `hidden`
-        // surviving DOMPurify, so "collapsed by default" is our guarantee.
-        body.hidden = true;
-        toggle.setAttribute('aria-expanded', 'false');
-
-        toggle.onclick = () => {
-            const expanded = toggle.getAttribute('aria-expanded') === 'true';
-            toggle.setAttribute('aria-expanded', String(!expanded));
-            body.hidden = expanded;
-        };
     }
 }
 
@@ -716,6 +690,10 @@ function handleEditorChange(panel) {
     // A continuation is a continuation OF something. Once that something moves,
     // say so rather than silently offering prose that no longer follows on.
     renderSuggestionStale(panel);
+
+    // Same reasoning, and the same string comparison: a displayed prompt that
+    // no longer matches the editor is no longer the prompt Continue would send.
+    renderInspectorStale(panel);
 
     // A conflict is sticky against every trigger. Showing "dirty" here would
     // tell the author their words are about to be saved when they are not.
@@ -750,6 +728,35 @@ let suggestion = null;
 
 /** The preflight awaiting a decision, or null. */
 let pendingPreflight = null;
+
+/**
+ * What the Context Inspector is showing, or null.
+ *
+ * VIEW state, and a SNAPSHOT.
+ *
+ * ⚠️ Never the object buildContinuePrompt() returned and never an array
+ * runContinue() sends. createRawPrompt mutates the array it is handed, in place
+ * (script.js:3886), so the array displayed must never be the array sent.
+ *
+ * ⚠️ `source` is the manuscript string the prompt was BUILT FROM, threaded
+ * in rather than re-read when the capture is stored. Re-reading would report
+ * "fresh" for a prompt assembled from older text whenever the author types
+ * during the tokenizer round trip — the region quietly claiming to show
+ * something it is not.
+ *
+ * @type {{origin: 'built'|'sent', source: string, chapterId: string,
+ *   generation: number, messages: Array<object>, excluded: Array<object>,
+ *   figures: object|null, refusal: {message: string, kind: string}|null}|null}
+ */
+let inspection = null;
+
+/**
+ * True while a prompt is being measured for the Inspector.
+ *
+ * Mirrors `building`, but it never gates Continue: inspecting costs no model
+ * request, so it must not disable the primary action.
+ */
+let inspecting = false;
 
 /**
  * True from the moment Continue is accepted until the attempt ends.
@@ -1009,6 +1016,10 @@ async function runGeneration(panel, prompt, target) {
     setSuggestionStatus(panel, null);
     renderSuggestion(panel);
 
+    // The prompt startContinue captured is now the one going out.
+    markInspectionSent(target);
+    renderInspection(panel);
+
     // ⚠️ Started BEFORE the bar is painted, and awaited after. runContinue
     // registers the generation synchronously, before its own first await, so
     // calling it first is what lets renderActionBar see one. Painting first and
@@ -1131,8 +1142,14 @@ async function startContinue(panel) {
     setSuggestionStatus(panel, null);
     setActionNote(panel, 'busy', 'Measuring the prompt…');
 
+    // ⚠️ Read ONCE and threaded through, so the string the prompt is built
+    // from is the same string the Inspector later compares against for
+    // staleness. Reading the editor again after the await would let them differ.
+    const source = editorOf(panel)?.value ?? '';
+
     building = true;
     renderActionBar(panel);
+    renderInspectorControls(panel);
 
     try {
         let prompt;
@@ -1141,10 +1158,17 @@ async function startContinue(panel) {
             // The EDITOR, not the saved copy: with a 2 s debounce the paragraph
             // the author just typed is usually still unsaved, and continuing
             // from the server's version would silently ignore it.
-            prompt = await buildContinuePrompt(editorOf(panel)?.value ?? '');
+            prompt = await buildContinuePrompt(source);
         } catch (error) {
             if (panel.isConnected) {
                 setActionNote(panel, 'error', error?.message ?? 'That did not work.');
+
+                if (isCurrentTarget(target.generation, target.chapterId)) {
+                    // A BUDGET refusal is the moment the Inspector is most
+                    // worth opening, so it gets the arithmetic that failed.
+                    refusalInspection(panel, error, target, source);
+                    renderInspection(panel);
+                }
             }
 
             return;
@@ -1155,6 +1179,11 @@ async function startContinue(panel) {
         if (!panel.isConnected || !isCurrentTarget(target.generation, target.chapterId)) {
             return;
         }
+
+        // Free: startContinue already built this prompt, so the Inspector costs
+        // no additional token counts on this path.
+        captureInspection(prompt, target, source, 'built');
+        renderInspection(panel);
 
         renderTrimNote(panel, prompt);
 
@@ -1173,6 +1202,8 @@ async function startContinue(panel) {
 
         if (live) {
             renderActionBar(live);
+            // Refresh was disabled while `building`; this is what releases it.
+            renderInspectorControls(live);
         }
     }
 }
@@ -1277,45 +1308,725 @@ function copyViaSelection(text) {
     }
 }
 
+/**
+ * Copy, by whichever path this browser actually offers.
+ *
+ * Shared by the suggestion pane and the Context Inspector so the fallback
+ * ladder exists once rather than three times.
+ *
+ * @param {string} text
+ * @returns {Promise<boolean>}
+ */
+async function copyToClipboard(text) {
+    try {
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+
+        return copyViaSelection(text);
+    } catch (error) {
+        console.error(`[${EXTENSION_NAME}] copy failed`, error);
+
+        // The modern API can be denied by policy even where it exists, so a
+        // rejection is not the end of the road.
+        return copyViaSelection(text);
+    }
+}
+
 /** @param {HTMLElement} panel */
 async function copySuggestion(panel) {
     if (!suggestion) {
         return;
     }
 
-    try {
-        if (navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(suggestion.text);
-        } else if (!copyViaSelection(suggestion.text)) {
-            throw new Error('copy command refused');
-        }
+    const copied = await copyToClipboard(suggestion.text);
+
+    if (!panel.isConnected) {
+        return;
+    }
+
+    if (copied) {
+        // ⚠️ The pane KEEPS the suggestion. Copying is non-destructive and
+        // repeatable; clearing here would punish the author for copying before
+        // deciding.
+        setSuggestionStatus(panel, 'idle', 'Copied.');
+    } else {
+        setSuggestionStatus(panel, 'error', 'Could not copy — select the text and copy it manually.');
+    }
+
+    renderSuggestion(panel);
+}
+
+/* --- context inspector (checkpoint 9) ------------------------------------
+
+   PLAN.md:365 asks for "the actual assembled prompt", and the honest version of
+   that claim is narrower than it sounds. Two things happen after we hand the
+   array to generateRaw and we can see neither: createRawPrompt prepends a
+   `name: ` prefix on non-openai, non-instruct backends (script.js:3885) and
+   then applies instruct formatting. So the heading says "Handed to
+   SillyTavern", not "the wire", and the note says what happens afterwards.
+
+   The list is numbered because block ORDER is a tunable (ARCHITECTURE.md:98):
+   the sent order and PROMPT_BLOCKS agree today, and the numbering is what will
+   make it visible on the day someone tunes one without the other. */
+
+/** What the author is told the region is, before any figures. */
+const INSPECTOR_NOTE = 'This is the prompt SillyNovel assembles, with macros expanded the way '
+    + 'SillyTavern expands them on the way out. Time and chance macros re-roll every time, so this '
+    + 'is a faithful sample rather than a byte-for-byte copy, and SillyTavern applies provider '
+    + 'formatting after this point. Building it costs no model request. Block order is a tunable; '
+    + 'the labels are not.';
+
+/**
+ * The two ways the figures could be misread, said plainly.
+ *
+ * Framing is counted as one joined string (generate.js), so per-block figures
+ * for the instruction and the contract do not exist and must not be implied.
+ * And every count is taken BEFORE substituteParams runs, so the text on screen
+ * can be visibly longer than the number beside it claims.
+ */
+const COUNT_CAVEAT = 'Framing is the instruction, the contract and the [MANUSCRIPT] header line '
+    + 'counted as one joined string, so there are no per-block figures. All counts are taken '
+    + 'before macros expand — SillyTavern expands them after we count, and the safety margin is '
+    + 'what covers the difference, along with the chat envelope no per-block count sees.';
+
+const RESERVE_SOURCE_LABEL = {
+    provider: 'from your API settings',
+    fallback: "SillyNovel's fallback — this backend exposes none",
+};
+
+/** @param {HTMLElement} panel */
+function isInspectorOpen(panel) {
+    return panel.querySelector('.sillynovel-inspector-toggle')?.getAttribute('aria-expanded') === 'true';
+}
+
+/**
+ * @param {HTMLElement} panel
+ * @param {string|null} state
+ * @param {string} [text]
+ * @param {() => void} [retry]
+ */
+function setInspectorStatus(panel, state, text, retry) {
+    const status = panel.querySelector('.sillynovel-inspector-status');
+
+    if (!status) {
+        return;
+    }
+
+    if (!state) {
+        status.hidden = true;
+        status.replaceChildren();
+        return;
+    }
+
+    status.dataset.state = state;
+    // replaceChildren, not textContent: it also clears any Retry button an
+    // earlier failure left behind.
+    status.replaceChildren(document.createTextNode(text ?? ''));
+
+    if (retry) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'sillynovel-inline-retry';
+        button.textContent = 'Retry';
+        button.addEventListener('click', retry);
+        status.append(' ', button);
+    }
+
+    status.hidden = false;
+}
+
+/** @param {object} prompt @param {string} label */
+function blockFor(prompt, label) {
+    return prompt.blocks.find((block) => block.label === label) ?? null;
+}
+
+/**
+ * The figures the Inspector may show, as a deliberate ALLOWLIST.
+ *
+ * ⚠️ AGENTS.md rule 13. This module never reaches into SillyTavern's context
+ * or the settings object behind it; every figure here arrives as a number
+ * already chosen by generate.js. Keep it that way — those settings sit beside
+ * provider credentials, and an allowlist of numbers cannot become a key dump.
+ * The guard is a grep over this file finding no such reads at all.
+ *
+ * @param {object} prompt a buildContinuePrompt() result
+ */
+function figuresFromPrompt(prompt) {
+    return {
+        contextTokens: prompt.contextTokens,
+        reserveTokens: prompt.reserveTokens,
+        reserveSource: prompt.reserveSource,
+        framingTokens: prompt.framingTokens,
+        marginTokens: prompt.marginTokens,
+        allowanceTokens: prompt.allowanceTokens,
+        manuscriptTokens: blockFor(prompt, 'MANUSCRIPT')?.tokens ?? null,
+        inputTokens: prompt.inputTokens,
+        trimmed: prompt.trimmed,
+        sentWords: prompt.sentWords,
+        totalWords: prompt.totalWords,
+    };
+}
+
+/**
+ * The same shape, from what a BUDGET refusal knew when it was thrown.
+ *
+ * A null is "not reached before the refusal" and is rendered as such: at the
+ * earliest throw site nothing has been counted at all, and saying so is the
+ * report that the tokenizer never ran.
+ *
+ * @param {object} budget GenerateError.budget
+ */
+function figuresFromBudget(budget) {
+    return {
+        contextTokens: budget.contextTokens,
+        reserveTokens: budget.reserveTokens,
+        reserveSource: budget.reserveSource,
+        framingTokens: budget.framingTokens,
+        marginTokens: budget.marginTokens,
+        allowanceTokens: budget.allowanceTokens,
+        manuscriptTokens: null,
+        inputTokens: null,
+        trimmed: false,
+        sentWords: null,
+        totalWords: null,
+    };
+}
+
+/**
+ * Store what the Inspector will show.
+ *
+ * ⚠️ `blocks[].content` is deliberately NOT read here. It is the raw,
+ * unwrapped duplicate of the same text; everything displayed comes from
+ * `messages[].content` through expandForDisplay, which carries the `[LABEL]`
+ * header that is actually sent and the macro expansion that is actually
+ * applied. Reading blocks[].content instead is the easiest mistake to make in
+ * this file and would show a prompt the model never received.
+ *
+ * @param {object} prompt a buildContinuePrompt() result
+ * @param {{chapterId: string, generation: number}} target
+ * @param {string} source the manuscript the prompt was built from
+ * @param {'built'|'sent'} origin
+ */
+function captureInspection(prompt, target, source, origin) {
+    inspection = {
+        origin,
+        source,
+        chapterId: target.chapterId,
+        generation: target.generation,
+        messages: expandForDisplay(prompt.messages).map((message, index) => {
+            const block = blockFor(prompt, message.label);
+
+            return {
+                position: index + 1,
+                role: message.role,
+                label: message.label,
+                expanded: message.expanded,
+                failed: message.failed,
+                text: message.content,
+                reason: block?.reason ?? '',
+                // MANUSCRIPT is the only block carrying its own count. A blank
+                // would read as "unknown" and a zero as "free", so the other two
+                // say where their tokens actually went.
+                tokenLabel: typeof block?.tokens === 'number'
+                    ? `${block.tokens.toLocaleString()} tokens`
+                    : 'counted with the framing',
+            };
+        }),
+        excluded: prompt.blocks
+            .filter((block) => !block.included)
+            .map((block) => ({ label: block.label, reason: block.reason })),
+        figures: figuresFromPrompt(prompt),
+        refusal: null,
+    };
+}
+
+/**
+ * A refusal is the state that most needs this region, so show the arithmetic
+ * that failed rather than only the sentence.
+ *
+ * @param {HTMLElement} panel
+ * @param {unknown} error
+ * @param {{chapterId: string, generation: number}} target
+ * @param {string} source
+ */
+function refusalInspection(panel, error, target, source) {
+    const kind = error?.kind ?? null;
+
+    // Not a refusal at all: a getTokenCountAsync round trip can fail outright,
+    // and that is a transient failure with a Retry, not a verdict about the
+    // prompt.
+    if (!kind) {
+        console.error(`[${EXTENSION_NAME}] could not measure the prompt`, error);
+        inspection = null;
 
         if (panel.isConnected) {
-            // ⚠️ The pane KEEPS the suggestion. Copying is non-destructive and
-            // repeatable; clearing here would punish the author for copying
-            // before deciding.
-            setSuggestionStatus(panel, 'idle', 'Copied.');
-            renderSuggestion(panel);
+            setInspectorStatus(panel, 'error', 'Could not measure the prompt.', () => {
+                void buildInspection(panel);
+            });
         }
-    } catch (error) {
-        // The modern API can be denied by policy even where it exists, so a
-        // rejection is not the end of the road.
-        if (copyViaSelection(suggestion.text)) {
-            if (panel.isConnected) {
-                setSuggestionStatus(panel, 'idle', 'Copied.');
-                renderSuggestion(panel);
-            }
 
+        return;
+    }
+
+    const budget = error?.budget ?? null;
+
+    inspection = {
+        origin: 'built',
+        source,
+        chapterId: target.chapterId,
+        generation: target.generation,
+        messages: [],
+        // ⚠️ These reasons are generated HERE rather than by generate.js, a
+        // deliberate exception to ARCHITECTURE.md:162-163. That rule asks the
+        // assembler to record a reason per block; on this path there is no
+        // assembled prompt for it to have recorded reasons about.
+        excluded: PROMPT_BLOCKS.map((label) => ({
+            label,
+            reason: 'not assembled — the prompt was refused before assembly',
+        })),
+        figures: budget ? figuresFromBudget(budget) : null,
+        refusal: {
+            message: error?.message ?? 'The prompt could not be assembled.',
+            kind,
+        },
+    };
+
+    if (panel.isConnected) {
+        setInspectorStatus(panel, null);
+    }
+}
+
+/**
+ * Flip a capture from "built" to "sent" when its generation goes out.
+ *
+ * ⚠️ Relabels only. Re-capturing here would re-run substituteParams and
+ * re-roll {{roll}}, {{random}} and {{time}}, so the region would show a
+ * DIFFERENT sample than the one this generation was actually assembled from.
+ *
+ * @param {{chapterId: string, generation: number}} target
+ */
+function markInspectionSent(target) {
+    if (inspection
+        && inspection.chapterId === target.chapterId
+        && inspection.generation === target.generation) {
+        inspection.origin = 'sent';
+    }
+}
+
+/**
+ * Build the prompt for display. Spends token counts; sends nothing.
+ *
+ * @param {HTMLElement} panel
+ */
+async function buildInspection(panel) {
+    if (inspecting) {
+        return;
+    }
+
+    const workspace = getWorkspace();
+
+    if (!workspace) {
+        return;
+    }
+
+    const target = {
+        chapterId: workspace.chapter.id,
+        // Captured at the trigger, like every other long action in this file.
+        generation: getWorkspaceGeneration(),
+    };
+    // ⚠️ Read ONCE, here, and threaded through. This exact string is both
+    // what the prompt is assembled from and what staleness is compared against
+    // later; reading the editor again after the await would let the two differ.
+    const source = editorOf(panel)?.value ?? '';
+
+    inspecting = true;
+    setInspectorStatus(panel, 'busy', 'Measuring…');
+    renderInspectorControls(panel);
+    renderInspection(panel);
+
+    try {
+        const prompt = await buildContinuePrompt(source);
+
+        // Token counting is async and can round-trip to the server, so the
+        // workspace may have moved while it ran. Painting chapter A's prompt
+        // under chapter B's title is the hazard clearSuggestion exists for.
+        if (!panel.isConnected || !isCurrentTarget(target.generation, target.chapterId)) {
             return;
         }
 
-        console.error(`[${EXTENSION_NAME}] copy failed`, error);
+        captureInspection(prompt, target, source, 'built');
+        setInspectorStatus(panel, null);
+    } catch (error) {
+        if (!panel.isConnected || !isCurrentTarget(target.generation, target.chapterId)) {
+            return;
+        }
 
-        if (panel.isConnected) {
-            setSuggestionStatus(panel, 'error', 'Could not copy — select the text and copy it manually.');
-            renderSuggestion(panel);
+        refusalInspection(panel, error, target, source);
+    } finally {
+        inspecting = false;
+
+        // Live, not captured: after a close and reopen the captured panel is
+        // detached and the REOPENED one is the one holding a stale control.
+        const live = document.getElementById('sillynovel-panel');
+
+        if (live) {
+            renderInspection(live);
+            renderInspectorControls(live);
         }
     }
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorControls(panel) {
+    const refresh = panel.querySelector('.sillynovel-inspector-refresh');
+    const copy = panel.querySelector('.sillynovel-inspector-copy');
+
+    if (refresh) {
+        // Disabled while a Continue is measuring: that path hands this region
+        // its capture for free, so refreshing now would pay for the same counts
+        // twice. Re-enabled from startContinue's finally.
+        refresh.disabled = inspecting || building;
+    }
+
+    if (copy) {
+        copy.disabled = !inspection || inspection.messages.length === 0;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorStale(panel) {
+    const stale = panel.querySelector('.sillynovel-inspector-stale');
+
+    if (!stale) {
+        return;
+    }
+
+    const editor = editorOf(panel);
+
+    // ⚠️ A STRING COMPARISON against the snapshot, never a re-measure. This
+    // runs on every keystroke, and token counting must not run in the typing
+    // path (ARCHITECTURE.md:165-166). Do not "improve" this into a rebuild.
+    stale.hidden = !inspection || !editor || editor.value === inspection.source;
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorNote(panel) {
+    const note = panel.querySelector('.sillynovel-inspector-note');
+
+    if (!note) {
+        return;
+    }
+
+    if (!inspection || inspection.refusal) {
+        note.textContent = INSPECTOR_NOTE;
+        return;
+    }
+
+    note.textContent = `${INSPECTOR_NOTE} ${inspection.origin === 'sent'
+        ? 'This is the prompt that was assembled and sent for the last Continue.'
+        : 'Built from the editor. Nothing was sent.'}`;
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorRefusal(panel) {
+    const box = panel.querySelector('.sillynovel-inspector-refusal');
+
+    if (!box) {
+        return;
+    }
+
+    const refusal = inspection?.refusal ?? null;
+
+    box.textContent = refusal?.message ?? '';
+    box.hidden = refusal === null;
+}
+
+/** @param {number|null} value */
+function tokenFigure(value) {
+    return typeof value === 'number'
+        ? `${value.toLocaleString()} tokens`
+        : 'not reached — the refusal came first';
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorFigures(panel) {
+    const list = panel.querySelector('.sillynovel-inspector-figures');
+    const caveat = panel.querySelector('.sillynovel-inspector-caveat');
+    const figures = inspection?.figures ?? null;
+
+    if (!list) {
+        return;
+    }
+
+    if (!figures) {
+        list.replaceChildren();
+        list.hidden = true;
+
+        if (caveat) {
+            caveat.hidden = true;
+        }
+
+        return;
+    }
+
+    const manuscript = figures.trimmed && typeof figures.sentWords === 'number'
+        ? `${tokenFigure(figures.manuscriptTokens)} · last ~${figures.sentWords.toLocaleString()} words of ${figures.totalWords.toLocaleString()}`
+        : tokenFigure(figures.manuscriptTokens);
+
+    const rows = [
+        ['Context size', tokenFigure(figures.contextTokens)],
+        ['Reply reserve', `${tokenFigure(figures.reserveTokens)} · ${RESERVE_SOURCE_LABEL[figures.reserveSource] ?? 'source unknown'}`],
+        ['Framing', tokenFigure(figures.framingTokens)],
+        ['Safety margin', tokenFigure(figures.marginTokens)],
+        ['Room left for the manuscript', tokenFigure(figures.allowanceTokens)],
+        ['Manuscript sent', manuscript],
+        ['Total input', tokenFigure(figures.inputTokens)],
+    ];
+
+    list.replaceChildren(...rows.map(([label, value]) => {
+        const item = document.createElement('li');
+        const name = document.createElement('span');
+        const amount = document.createElement('span');
+
+        name.className = 'sillynovel-inspector-figure-label';
+        name.textContent = label;
+        amount.className = 'sillynovel-inspector-figure-value';
+        amount.textContent = value;
+        item.append(name, amount);
+
+        return item;
+    }));
+
+    list.hidden = false;
+
+    if (caveat) {
+        caveat.textContent = COUNT_CAVEAT;
+        caveat.hidden = false;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorExcluded(panel) {
+    const list = panel.querySelector('.sillynovel-inspector-blocks');
+    const heading = panel.querySelector('.sillynovel-inspector-heading[data-part="excluded"]');
+    const excluded = inspection?.excluded ?? [];
+
+    if (list) {
+        list.replaceChildren(...excluded.map((block) => {
+            const item = document.createElement('li');
+            item.textContent = `[${block.label}] — ${block.reason}`;
+            return item;
+        }));
+    }
+
+    if (heading) {
+        heading.hidden = excluded.length === 0;
+    }
+}
+
+/** @param {object} message */
+function macroNote(message) {
+    if (message.failed) {
+        return 'macro expansion failed — showing the unexpanded text';
+    }
+
+    return message.expanded ? 'macros expanded' : 'no macros to expand';
+}
+
+/** @param {HTMLElement} panel */
+function renderInspectorWire(panel) {
+    const list = panel.querySelector('.sillynovel-inspector-wire');
+    const heading = panel.querySelector('.sillynovel-inspector-heading[data-part="wire"]');
+    const messages = inspection?.messages ?? [];
+
+    if (list) {
+        list.replaceChildren(...messages.map((message) => {
+            const item = document.createElement('li');
+            const head = document.createElement('p');
+            const reason = document.createElement('p');
+            const text = document.createElement('div');
+
+            item.className = 'sillynovel-inspector-message';
+
+            head.className = 'sillynovel-inspector-message-head';
+            head.textContent = `${message.position} · ${message.role} · [${message.label}]`;
+
+            reason.className = 'sillynovel-inspector-message-reason';
+            reason.textContent = [message.reason, message.tokenLabel, macroNote(message)]
+                .filter(Boolean)
+                .join(' · ');
+
+            // ⚠️ textContent, never innerHTML. CSS white-space: pre-wrap is
+            // what preserves the paragraph breaks markup would have carried.
+            text.className = 'sillynovel-inspector-message-text';
+            text.textContent = message.text;
+
+            item.append(head, reason, text);
+
+            return item;
+        }));
+    }
+
+    if (heading) {
+        heading.hidden = messages.length === 0;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function renderInspection(panel) {
+    const region = panel.querySelector('.sillynovel-inspector');
+    const empty = panel.querySelector('.sillynovel-inspector-empty');
+
+    if (region) {
+        if (inspecting) {
+            region.dataset.state = 'busy';
+        } else if (inspection === null) {
+            region.dataset.state = 'empty';
+        } else if (inspection.refusal) {
+            region.dataset.state = 'refused';
+        } else {
+            region.dataset.state = 'ready';
+        }
+    }
+
+    // Painting into a collapsed body is wasted work; expanding repaints.
+    if (!isInspectorOpen(panel)) {
+        return;
+    }
+
+    if (empty) {
+        empty.hidden = inspection !== null || inspecting;
+    }
+
+    renderInspectorNote(panel);
+    renderInspectorRefusal(panel);
+    renderInspectorFigures(panel);
+    renderInspectorExcluded(panel);
+    renderInspectorWire(panel);
+    renderInspectorStale(panel);
+}
+
+/**
+ * Drop what the region is showing. Called on every chapter install.
+ *
+ * ⚠️ Clears, but deliberately does NOT collapse and does NOT rebuild. The
+ * disclosure state belongs to the author, and rebuilding here would spend two
+ * to five tokenizer round trips on every chapter switch — incidental counting
+ * is exactly what ARCHITECTURE.md:165-166 rules out. Expanding is an explicit
+ * act and may pay for itself; navigating is not.
+ *
+ * @param {HTMLElement} panel
+ */
+function clearInspection(panel) {
+    inspection = null;
+    setInspectorStatus(panel, null);
+    renderInspection(panel);
+    renderInspectorControls(panel);
+}
+
+/**
+ * A role-annotated transcript, not JSON.
+ *
+ * JSON.stringify escapes every newline, which turns a full chapter into one
+ * unreadable line — the opposite of what a region that exists to be pasted
+ * into a diff is for. The separators cost paste-ready fidelity: this cannot be
+ * dropped verbatim into a playground, and it is not meant to be.
+ */
+function inspectionTranscript() {
+    if (!inspection) {
+        return '';
+    }
+
+    const lines = [
+        inspection.origin === 'sent'
+            ? 'SillyNovel — the prompt assembled and sent for the last Continue'
+            : 'SillyNovel — prompt built from the editor; nothing was sent',
+        '',
+    ];
+
+    for (const message of inspection.messages) {
+        lines.push(`--- ${message.position} · ${message.role} ---`, message.text, '');
+    }
+
+    if (inspection.excluded.length > 0) {
+        lines.push('--- not sent ---');
+
+        for (const block of inspection.excluded) {
+            lines.push(`[${block.label}] — ${block.reason}`);
+        }
+    }
+
+    return lines.join('\n');
+}
+
+/** @param {HTMLElement} panel */
+async function copyInspection(panel) {
+    const text = inspectionTranscript();
+
+    if (!text) {
+        return;
+    }
+
+    const copied = await copyToClipboard(text);
+
+    if (!panel.isConnected) {
+        return;
+    }
+
+    if (copied) {
+        setInspectorStatus(panel, 'idle', 'Copied.');
+    } else {
+        setInspectorStatus(panel, 'error', 'Could not copy — select the text and copy it manually.');
+    }
+}
+
+/**
+ * Wire the region's controls. Called once per mount, like wireEditor.
+ *
+ * @param {HTMLElement} panel
+ */
+function wireInspector(panel) {
+    const toggle = panel.querySelector('.sillynovel-inspector-toggle');
+    const body = panel.querySelector('.sillynovel-inspector-body');
+    const refresh = panel.querySelector('.sillynovel-inspector-refresh');
+    const copy = panel.querySelector('.sillynovel-inspector-copy');
+
+    if (toggle && body) {
+        // Set explicitly rather than relying on the template's `hidden`
+        // surviving DOMPurify, so "collapsed by default" is our guarantee.
+        body.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+
+        toggle.onclick = () => {
+            const open = toggle.getAttribute('aria-expanded') === 'true';
+
+            toggle.setAttribute('aria-expanded', String(!open));
+            body.hidden = open;
+
+            if (open) {
+                return;
+            }
+
+            if (inspection === null) {
+                void buildInspection(panel);
+            } else {
+                renderInspection(panel);
+            }
+        };
+    }
+
+    if (refresh) {
+        refresh.onclick = () => { void buildInspection(panel); };
+    }
+
+    if (copy) {
+        copy.onclick = () => { void copyInspection(panel); };
+    }
+
+    renderInspectorControls(panel);
+    renderInspection(panel);
 }
 
 /**
@@ -1450,6 +2161,9 @@ export function flushOnClose() {
     // Continue button over a request the author is still paying for.
     suggestion = null;
     pendingPreflight = null;
+    // The rendered prompt is view state too, and it holds a copy of the
+    // manuscript. It goes when the panel goes.
+    inspection = null;
 
     // Flush the local copy first and unconditionally. The ~500 ms timer may not
     // have fired for the last keystrokes, and unlike the server save this one
@@ -1486,7 +2200,7 @@ export async function renderWorkspace(panel) {
             return;
         }
 
-        renderInspector(panel);
+        wireInspector(panel);
         wireEditor(panel);
 
         const newChapter = panel.querySelector('.sillynovel-new-chapter');

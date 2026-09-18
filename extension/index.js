@@ -42,6 +42,10 @@ function probeContextApis(context) {
         'getTokenCountAsync',
         'getTokenizerModel',
         'stopGeneration',
+        // Checkpoint 9: the Context Inspector must expand macros itself, or it
+        // shows a prompt the model never received (substituteParams runs inside
+        // generateRaw with no opt-out, script.js:3886).
+        'substituteParams',
         // Load-bearing from checkpoint 4 on: every plugin write needs the
         // CSRF token this returns, and AGENTS.md forbids hand-assembling it.
         'getRequestHeaders',

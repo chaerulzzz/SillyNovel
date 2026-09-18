@@ -264,6 +264,7 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
         grid-template-rows: auto minmax(160px, 1fr) auto auto;
         overflow-y: auto;
     }
+
 }
 
 /* --- nav rail --- */
@@ -430,10 +431,30 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 
 /* --- context inspector --- */
 
+/* The grid gives this region an `auto` row against the editor's
+   minmax(0, 1fr). Expanded with a full chapter in it the region is thousands of
+   pixels tall, the editor row is crushed toward zero, and because
+   .sillynovel-editor carries min-height it SPILLS rather than shrinking. The
+   bound belongs here rather than on the grid: one scroller, nothing truncated,
+   every byte still selectable and copyable. */
 .sillynovel-inspector {
     grid-area: inspector;
     border-top: 1px solid var(--SmartThemeBorderColor);
     padding-top: 8px;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+/* ⚠️ Must come AFTER the rule above, not beside the other stacked-layout
+   rules in the earlier media query: both selectors have the same specificity,
+   so whichever is declared last wins. Below 1000px .sillynovel-workspace-ready
+   already scrolls, and leaving the bound on would nest one scroller inside
+   another. Stacked, the region simply grows and the workspace scrolls it. */
+@media (max-width: 1000px) {
+    .sillynovel-inspector {
+        max-height: none;
+        overflow-y: visible;
+    }
 }
 
 .sillynovel-inspector-toggle {
@@ -456,17 +477,133 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     margin: 0;
     padding: 0;
     display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
+    flex-direction: column;
+    gap: 4px;
     font-family: var(--monoFontFamily);
     font-size: calc(var(--mainFontSize) * 0.85);
     opacity: 0.7;
 }
 
+/* Dashed = not sent. The wire list below is solid, and the contrast is the
+   fastest read in the region. */
 .sillynovel-inspector-blocks li {
     border: 1px dashed var(--SmartThemeBorderColor);
     border-radius: 4px;
     padding: 2px 6px;
+}
+
+.sillynovel-inspector-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.sillynovel-inspector-status {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.75;
+}
+
+.sillynovel-inspector-status[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-inspector-stale,
+.sillynovel-inspector-refusal {
+    margin: 0 0 8px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-inspector-refusal {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.sillynovel-inspector-empty,
+.sillynovel-inspector-caveat {
+    margin: 0 0 8px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.7;
+}
+
+.sillynovel-inspector-heading {
+    margin: 12px 0 6px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+}
+
+.sillynovel-inspector-figures {
+    list-style: none;
+    margin: 0 0 8px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.sillynovel-inspector-figures li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.sillynovel-inspector-figure-label {
+    opacity: 0.75;
+}
+
+.sillynovel-inspector-figure-value {
+    font-family: var(--monoFontFamily);
+    white-space: nowrap;
+}
+
+.sillynovel-inspector-wire {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.sillynovel-inspector-message {
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+/* No opacity reduction: this line carries the position, which is the whole
+   point of rendering the list in send order. */
+.sillynovel-inspector-message-head {
+    margin: 0 0 2px;
+    font-family: var(--monoFontFamily);
+    font-size: calc(var(--mainFontSize) * 0.85);
+    font-weight: 600;
+}
+
+.sillynovel-inspector-message-reason {
+    margin: 0 0 6px;
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
+}
+
+/* A div, not a pre: `white-space: pre` would scroll a long chapter sideways,
+   and ST styles bare elements. Monospace signals payload rather than prose. */
+.sillynovel-inspector-message-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--monoFontFamily);
+    font-size: calc(var(--mainFontSize) * 0.85);
+    line-height: 1.5;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background-color: var(--black30a);
 }
 
 /* --- error state --- */
@@ -573,7 +710,9 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-preflight-cancel,
 .sillynovel-insert,
 .sillynovel-copy,
-.sillynovel-discard {
+.sillynovel-discard,
+.sillynovel-inspector-refresh,
+.sillynovel-inspector-copy {
     width: auto;
     background: none;
     border: 1px solid var(--SmartThemeBorderColor);
@@ -592,6 +731,10 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-insert:hover,
 .sillynovel-copy:hover,
 .sillynovel-discard:hover,
+.sillynovel-inspector-refresh:hover,
+.sillynovel-inspector-copy:hover,
+.sillynovel-inspector-refresh:focus-visible,
+.sillynovel-inspector-copy:focus-visible,
 .sillynovel-continue:focus-visible,
 .sillynovel-cancel:focus-visible,
 .sillynovel-preflight-confirm:focus-visible,
@@ -603,7 +746,9 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 }
 
 .sillynovel-continue:disabled,
-.sillynovel-insert:disabled {
+.sillynovel-insert:disabled,
+.sillynovel-inspector-refresh:disabled,
+.sillynovel-inspector-copy:disabled {
     opacity: 0.5;
     cursor: default;
 }

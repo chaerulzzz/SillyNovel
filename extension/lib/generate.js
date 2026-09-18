@@ -116,11 +116,21 @@ export const GenerateErrorKind = {
 };
 
 export class GenerateError extends Error {
-    constructor(kind, message, { cause = null } = {}) {
+    /**
+     * @param {string} kind one of GenerateErrorKind
+     * @param {string} message author-facing text
+     * @param {{cause?: Error|null, budget?: object|null}} [options] `budget`
+     *   carries the figures known at the moment a BUDGET refusal was thrown, so
+     *   the Inspector can show the arithmetic that failed rather than only the
+     *   sentence. A null field means "not reached before the refusal" — which
+     *   is itself the report that the tokenizer never ran — and not zero.
+     */
+    constructor(kind, message, { cause = null, budget = null } = {}) {
         super(message);
         this.name = 'GenerateError';
         this.kind = kind;
         this.cause = cause;
+        this.budget = budget;
     }
 }
 
@@ -203,6 +213,7 @@ function readBudget() {
             api: 'openai',
             contextTokens: Number(settings.openai_max_context) || 0,
             reserveTokens: Number(settings.openai_max_tokens) || 0,
+            reserveSource: 'provider',
         };
     }
 
@@ -210,6 +221,29 @@ function readBudget() {
         api: context.mainApi,
         contextTokens: Number(context.maxContext) || 0,
         reserveTokens: FALLBACK_RESERVE_TOKENS,
+        reserveSource: 'fallback',
+    };
+}
+
+/**
+ * The figures a BUDGET refusal carries, as a deliberate ALLOWLIST.
+ *
+ * ⚠️ AGENTS.md rule 13. Never spread `budget` or `chatCompletionSettings`
+ * into this: the settings object IS `oai_settings` and sits beside provider
+ * credentials. Four numbers and a source label cannot become a key dump.
+ *
+ * @param {object} budget a readBudget() result
+ * @param {number|null} framingTokens null when nothing had been counted yet
+ * @param {number|null} allowanceTokens null when the refusal came first
+ */
+function refusalFigures(budget, framingTokens, allowanceTokens) {
+    return {
+        contextTokens: budget.contextTokens,
+        reserveTokens: budget.reserveTokens,
+        reserveSource: budget.reserveSource,
+        marginTokens: MARGIN_TOKENS,
+        framingTokens,
+        allowanceTokens,
     };
 }
 
@@ -313,8 +347,19 @@ function countWords(text) {
  * Pure apart from token counting: it reads settings and counts, and touches no
  * module state. Checkpoint 9's Inspector calls it without generating.
  *
+ * The four budget figures are a deliberate ALLOWLIST for the Inspector
+ * (AGENTS.md rule 13), not a settings dump. They are returned rather than
+ * recomputed by the caller because readBudget()'s values are snapshots: a
+ * recompute after the build would read a DIFFERENT snapshot, and showing
+ * numbers that did not produce the displayed prompt is the Inspector's worst
+ * failure mode.
+ *
  * @param {string} manuscript what the EDITOR holds, not the saved copy
- * @returns {Promise<{messages: Array<{role: string, content: string}>, blocks: Array<object>, inputTokens: number, framingTokens: number, reserveTokens: number, trimmed: boolean, sentWords: number, totalWords: number}>}
+ * @returns {Promise<{messages: Array<{role: string, content: string}>,
+ *   blocks: Array<object>, inputTokens: number, framingTokens: number,
+ *   reserveTokens: number, reserveSource: string, contextTokens: number,
+ *   allowanceTokens: number, marginTokens: number, trimmed: boolean,
+ *   sentWords: number, totalWords: number}>}
  */
 export async function buildContinuePrompt(manuscript) {
     const text = typeof manuscript === 'string' ? manuscript : '';
@@ -338,6 +383,7 @@ export async function buildContinuePrompt(manuscript) {
             `There is no room to send this chapter: the reply reserve (${budget.reserveTokens} tokens) `
             + `leaves nothing inside the context size (${budget.contextTokens} tokens). `
             + 'Lower the response length or raise the context size in your API settings.',
+            { budget: refusalFigures(budget, null, null) },
         );
     }
 
@@ -362,6 +408,7 @@ export async function buildContinuePrompt(manuscript) {
             `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens) and the `
             + `instructions leave nothing inside the context size (${budget.contextTokens} tokens). `
             + 'Lower the response length or raise the context size in your API settings.',
+            { budget: refusalFigures(budget, framingTokens, allowance) },
         );
     }
 
@@ -372,6 +419,7 @@ export async function buildContinuePrompt(manuscript) {
             GenerateErrorKind.BUDGET,
             `This chapter will not fit: even its last ${allowance} tokens of room cannot be filled safely. `
             + 'Lower the response length or raise the context size in your API settings.',
+            { budget: refusalFigures(budget, framingTokens, allowance) },
         );
     }
 
@@ -416,10 +464,66 @@ export async function buildContinuePrompt(manuscript) {
         inputTokens: framingTokens + fitted.tokens,
         framingTokens,
         reserveTokens: budget.reserveTokens,
+        reserveSource: budget.reserveSource,
+        contextTokens: budget.contextTokens,
+        allowanceTokens: allowance,
+        marginTokens: MARGIN_TOKENS,
         trimmed: fitted.trimmed,
         sentWords: countWords(fitted.text),
         totalWords: countWords(text),
     };
+}
+
+/**
+ * What SillyTavern will show the model, as closely as we can honestly render it.
+ *
+ * The Inspector calls this rather than displaying `messages` raw, because
+ * substituteParams runs INSIDE generateRaw (createRawPrompt, script.js:3886)
+ * with no opt-out: an unexpanded render would show a prompt the model never
+ * received.
+ *
+ * ⚠️ A SAMPLE, not a copy of the wire, for two reasons. `{{time}}`, `{{roll}}`
+ * and `{{random}}` re-evaluate per call, so a second render differs from the
+ * first. And createRawPrompt does more after we hand over — a `name: ` prefix
+ * on non-openai, non-instruct backends (script.js:3885), then instruct
+ * formatting — none of which is modelled here. We cannot see past generateRaw.
+ *
+ * ⚠️ Returns FRESH objects. createRawPrompt mutates the array it is handed
+ * in place, so what is displayed must never be what is sent.
+ *
+ * @param {Array<{role: string, content: string}>} messages from buildContinuePrompt
+ * @returns {Array<{role: string, label: string, content: string, expanded: boolean, failed: boolean}>}
+ */
+export function expandForDisplay(messages) {
+    const context = SillyTavern.getContext();
+    const usable = typeof context?.substituteParams === 'function';
+
+    return (messages ?? []).map((message) => {
+        const content = message?.content ?? '';
+        const role = message?.role ?? '';
+        const label = PROMPT_BLOCKS.find((name) => content.startsWith(`[${name}]\n`)) ?? '';
+        const raw = { role, label, content, expanded: false, failed: true };
+
+        // Degrade to the unexpanded text rather than blanking the region: an
+        // ST upgrade that moves substituteParams should cost fidelity, not the
+        // whole Inspector. `failed` is surfaced on screen, never swallowed.
+        if (!usable) {
+            return raw;
+        }
+
+        try {
+            const text = context.substituteParams(content);
+
+            if (typeof text !== 'string') {
+                return raw;
+            }
+
+            return { role, label, content: text, expanded: text !== content, failed: false };
+        } catch (error) {
+            console.warn('[SillyNovel] substituteParams failed; showing unexpanded text', error);
+            return raw;
+        }
+    });
 }
 
 /** @param {object} prompt a buildContinuePrompt() result */
@@ -517,14 +621,31 @@ export async function runContinue({ prompt, chapterId, chapterTitle, generation 
         // unrelated "No message generated".
         trimNames: false,
 
-        // responseLength is deliberately NOT passed. TempResponseLength
-        // (script.js:4094) stashes the author's real setting in a single static
-        // field, so two overlapping overrides leave openai_max_tokens
-        // permanently set to ours; saveSettings (:8000-8008) also refuses to run
-        // while one is live, and session.js calls saveSettingsDebounced() on
-        // every chapter open. Using the author's own configured reply length
-        // costs us nothing and is what lets the NO_MESSAGE state name a setting
-        // they can actually change.
+        // responseLength is not passed YET. The decision is settled and
+        // documented (ARCHITECTURE.md §5): a conditional floor, scoped to
+        // chat completion, raising the reserve only when the author's own
+        // setting sits below it and only as far as the context affords —
+        // implemented as the first item of Phase 3, not here, so Phase 2 closes
+        // on the generation path it was verified against.
+        //
+        // The hazard is narrower than it first looked. TempResponseLength
+        // (script.js:4094) stashes the author's setting in one static field, so
+        // two overlapping overrides strand openai_max_tokens at ours; but the
+        // override never spans the network call (restore runs at :3995/4000/4005
+        // before the fetch, and on the openai path via the
+        // CHAT_COMPLETION_SETTINGS_READY hook at openai.js:3052, before the
+        // fetch at :3055), our single-flight means we cannot race ourselves, and
+        // ST's own generateQuietPrompt takes the same risk at :3045-3057.
+        // Scoping to chat completion keeps amount_gen — the author's own
+        // generation-length dial on every other backend (:4112-4113) — out of
+        // it entirely.
+        //
+        // ⚠️ When it lands, the number passed and the number reserved must be
+        // the SAME: readBudget().reserveTokens IS openai_max_tokens, so
+        // budgeting against one figure while requesting another would silently
+        // overfill the context. NO_MESSAGE stays either way — below roughly an
+        // 8.2k context the cap cannot reach the floor, and naming a setting the
+        // author can change is then their only signal.
     });
 
     active = { promise, chapterId, chapterTitle, generation };
