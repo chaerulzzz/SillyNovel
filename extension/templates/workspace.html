@@ -83,6 +83,28 @@
             </div>
         </aside>
 
+        <section class="sillynovel-profile" aria-label="Writing Profile">
+            <button type="button" class="sillynovel-profile-toggle" aria-expanded="false">Writing Profile</button>
+            <div class="sillynovel-profile-body" hidden>
+                <p class="sillynovel-profile-note">How the prose should read. Sent first with every request and never trimmed. Stored with the project on the server.</p>
+                <div class="sillynovel-profile-fields">
+                    <label class="sillynovel-profile-label">Voice<textarea class="sillynovel-profile-field" data-field="voice" rows="2" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Genre<textarea class="sillynovel-profile-field" data-field="genre" rows="1" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Point of view<textarea class="sillynovel-profile-field" data-field="pov" rows="1" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Tense<textarea class="sillynovel-profile-field" data-field="tense" rows="1" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Style instructions<textarea class="sillynovel-profile-field" data-field="styleInstructions" rows="4" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label sillynovel-profile-label-wide">Prose examples<textarea class="sillynovel-profile-field" data-field="proseExamples" rows="8" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Boundaries<textarea class="sillynovel-profile-field" data-field="boundaries" rows="3" spellcheck="false"></textarea></label>
+                </div>
+                <div class="sillynovel-profile-actions">
+                    <button type="button" class="sillynovel-profile-save" disabled>Save profile</button>
+                    <button type="button" class="sillynovel-profile-discard" disabled>Discard changes</button>
+                    <button type="button" class="sillynovel-profile-reload" hidden>Reload profile</button>
+                    <span class="sillynovel-profile-status" role="status"></span>
+                </div>
+            </div>
+        </section>
+
         <section class="sillynovel-inspector" aria-label="Context Inspector">
             <button type="button" class="sillynovel-inspector-toggle" aria-expanded="false">Context Inspector</button>
             <div class="sillynovel-inspector-body" hidden>

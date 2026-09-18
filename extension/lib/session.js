@@ -24,7 +24,11 @@ const SETTINGS_KEY = 'sillynovel';
  * second field here would give it two owners, and they would drift the moment
  * addChapter() refreshed one of them.
  *
- * @type {{project: {id: string, title: string, chapters: Array<{id: string, title: string}>}, chapter: {id: string, title: string}, content: string, etag: string}|null}
+ * `profile` is the Writing Profile as last read or saved, with its own etag: a
+ * separate document with a separate compare-and-swap, held here rather than
+ * in module state of its own so it has one owner and clears with the rest.
+ *
+ * @type {{project: {id: string, title: string, chapters: Array<{id: string, title: string}>}, chapter: {id: string, title: string}, content: string, etag: string, profile: {data: object, etag: string}}|null}
  */
 let current = null;
 
@@ -124,6 +128,27 @@ let halted = null;
 let pendingOffer = null;
 
 /**
+ * The in-flight profile save, or null. Single-flight: the profile is one
+ * document, so there is nothing to key by.
+ *
+ * ⚠️ Like saveInFlight, deliberately NOT cleared by resetWorkspace(), and
+ * awaited before any re-read — a close-flush PUT that lands after a quick
+ * reopen's GET would leave the next save comparing against a revision the
+ * server has already moved past.
+ * @type {Promise<object|null>|null}
+ */
+let profileSaveInFlight = null;
+
+/**
+ * Why the profile has stopped saving, or null. PROJECT-scoped, and separate
+ * from `halted`: a chapter's conflict must not freeze the profile, nor the
+ * reverse. 413 is not a halt here — there is no autosave loop to stop, so the
+ * Save button stays live with a shorten message.
+ * @type {{projectId: string, reason: 'conflict'}|null}
+ */
+let profileHalt = null;
+
+/**
  * The extension's settings bag.
  *
  * Lives here rather than in panel.js because this module owns the persisted
@@ -220,11 +245,21 @@ async function resolve() {
 
     const loaded = await api.getChapter(project.id, chapter.id);
 
+    // ⚠️ A failed profile read aborts the resolve like every other read here.
+    // Opening without it would let Continue silently send without a
+    // never-dropped block (ARCHITECTURE.md:164), and without an etag no save
+    // is possible anyway. A plugin that has not been restarted answers this
+    // route with SillyTavern's HTML, which api.js reports as PLUGIN_ABSENT —
+    // whose message already says to restart.
+    await settlePendingProfileSave();
+    const loadedProfile = await api.getProfile(project.id);
+
     current = {
         project,
         chapter: { id: chapter.id, title: chapter.title },
         content: loaded.content,
         etag: loaded.etag,
+        profile: { data: loadedProfile.profile, etag: loadedProfile.etag },
     };
 
     // A new workspace object: anything captured against the previous one is stale.
@@ -701,4 +736,133 @@ export function resetWorkspace() {
     workspaceGeneration += 1;
     halted = null;
     pendingOffer = null;
+    profileHalt = null;
+}
+
+/* --- the Writing Profile (Phase 3 checkpoint 2) --------------------------- */
+
+/** @returns {{data: object, etag: string}|null} */
+export function getProfile() {
+    return current?.profile ?? null;
+}
+
+/**
+ * Why the profile has stopped saving for the open project, or null.
+ * @returns {'conflict'|null}
+ */
+export function getProfileHalt() {
+    if (!current || !profileHalt || profileHalt.projectId !== current.project.id) {
+        return null;
+    }
+    return profileHalt.reason;
+}
+
+/**
+ * Is a captured profile action still speaking for the project open now?
+ *
+ * A project-scoped twin of isCurrentTarget(), not a widened one: the profile
+ * survives chapter switches, so a save started in chapter A must land after
+ * the author has moved to chapter B of the same project.
+ *
+ * @param {number} generation
+ * @param {string} projectId
+ */
+export function isCurrentProject(generation, projectId) {
+    return current !== null
+        && generation === workspaceGeneration
+        && current.project.id === projectId;
+}
+
+async function settlePendingProfileSave() {
+    if (!profileSaveInFlight) {
+        return;
+    }
+    try {
+        await profileSaveInFlight;
+    } catch {
+        // Deliberately ignored — the read that follows establishes the revision.
+    }
+}
+
+async function performProfileSave(projectId, generation, data, etag) {
+    let result;
+
+    try {
+        result = await api.putProfile(projectId, data, etag);
+    } catch (error) {
+        if (!isCurrentProject(generation, projectId)) {
+            return null;
+        }
+        if (error?.kind === api.ApiErrorKind.CONFLICT) {
+            profileHalt = { projectId, reason: 'conflict' };
+        }
+        throw error;
+    }
+
+    if (!isCurrentProject(generation, projectId)) {
+        return null;
+    }
+
+    // The server's own copy — unknown keys it preserved included — and the
+    // revision to compare against next time.
+    current.profile = { data: result.profile, etag: result.etag };
+
+    return current.profile;
+}
+
+/**
+ * Save the profile, as a compare-and-swap. Single-flight: a second call while
+ * one runs gets the RUNNING promise, which does not carry the newer data —
+ * the view re-checks dirtiness when it resolves, as it does for chapters.
+ *
+ * @param {object} data the whole profile object, unknown keys included
+ * @returns {Promise<{data: object, etag: string}|null>} null when halted or stale
+ */
+export function saveProfile(data) {
+    if (!current || getProfileHalt() !== null) {
+        return Promise.resolve(null);
+    }
+
+    if (profileSaveInFlight) {
+        return profileSaveInFlight;
+    }
+
+    const promise = performProfileSave(current.project.id, workspaceGeneration, data, current.profile.etag)
+        .finally(() => {
+            if (profileSaveInFlight === promise) {
+                profileSaveInFlight = null;
+            }
+        });
+
+    profileSaveInFlight = promise;
+
+    return promise;
+}
+
+/**
+ * Re-read the profile from the server and clear a conflict halt. The only way
+ * out of a conflict, and it REPLACES what is in memory — the view is expected
+ * to have told the author so before calling this.
+ *
+ * @returns {Promise<{data: object, etag: string}|null>}
+ */
+export async function reloadProfile() {
+    if (!current) {
+        return null;
+    }
+
+    const projectId = current.project.id;
+    const generation = workspaceGeneration;
+
+    await settlePendingProfileSave();
+    const loaded = await api.getProfile(projectId);
+
+    if (!isCurrentProject(generation, projectId)) {
+        return null;
+    }
+
+    current.profile = { data: loaded.profile, etag: loaded.etag };
+    profileHalt = null;
+
+    return current.profile;
 }

@@ -18,18 +18,23 @@ import {
     declineOffer,
     getHalt,
     getPendingOffer,
+    getProfile,
+    getProfileHalt,
     getWorkspaceGeneration,
     isCurrentTarget,
     recordDraft,
     getWorkspace,
     openChapter,
+    reloadProfile,
     resolveWorkspace,
     saveChapter,
+    saveProfile,
 } from './session.js';
 import {
     GenerateErrorKind,
     PROMPT_BLOCKS,
     buildContinuePrompt,
+    renderProfileText,
     cancelGeneration,
     expandForDisplay,
     getActiveGeneration,
@@ -989,7 +994,11 @@ function showPreflight(panel, prompt, target) {
     message.textContent = [
         'This is a large request.',
         `Scope: ${scope}.`,
-        `About ${prompt.inputTokens} input tokens, plus up to ${prompt.reserveTokens} for the reply.`,
+        `About ${prompt.inputTokens} input tokens, plus up to ${prompt.reserveTokens} for the reply`
+            + (prompt.reserveSource === 'raised-by-sillynovel'
+                ? ` (raised by SillyNovel from your ${prompt.authorReserveTokens}).`
+                : '.'),
+        ...(prompt.profileTokens > 0 ? [`Of those input tokens, the Writing Profile is ${prompt.profileTokens}.`] : []),
         'Requests: 1.',
         'The price is not known — SillyNovel cannot see your provider’s rates.',
     ].join('\n');
@@ -1158,7 +1167,7 @@ async function startContinue(panel) {
             // The EDITOR, not the saved copy: with a 2 s debounce the paragraph
             // the author just typed is usually still unsaved, and continuing
             // from the server's version would silently ignore it.
-            prompt = await buildContinuePrompt(source);
+            prompt = await buildContinuePrompt(source, { profile: readProfileForm(panel) });
         } catch (error) {
             if (panel.isConnected) {
                 setActionNote(panel, 'error', error?.message ?? 'That did not work.');
@@ -1387,14 +1396,33 @@ const INSPECTOR_NOTE = 'This is the prompt SillyNovel assembles, with macros exp
  * can be visibly longer than the number beside it claims.
  */
 const COUNT_CAVEAT = 'Framing is the instruction, the contract and the [MANUSCRIPT] header line '
-    + 'counted as one joined string, so there are no per-block figures. All counts are taken '
-    + 'before macros expand — SillyTavern expands them after we count, and the safety margin is '
-    + 'what covers the difference, along with the chat envelope no per-block count sees.';
+    + 'counted as one joined string, so those have no per-block figures; the Writing Profile and '
+    + 'the manuscript are counted on their own and shown beside their blocks. All counts are '
+    + 'taken before macros expand — SillyTavern expands them after we count, and the safety '
+    + 'margin is what covers the difference, along with the chat envelope no per-block count sees.';
 
 const RESERVE_SOURCE_LABEL = {
     provider: 'from your API settings',
     fallback: "SillyNovel's fallback — this backend exposes none",
+    'raised-by-sillynovel': 'raised by SillyNovel',
 };
+
+/**
+ * The reply-reserve figure, saying where the number came from — and, when
+ * SillyNovel raised it, what it was raised FROM, since that is the setting the
+ * author can actually see in their API panel.
+ *
+ * @param {{reserveTokens: number|null, authorReserveTokens?: number|null, reserveSource: string}} figures
+ */
+function reserveFigure(figures) {
+    const base = tokenFigure(figures.reserveTokens);
+
+    if (figures.reserveSource === 'raised-by-sillynovel' && typeof figures.authorReserveTokens === 'number') {
+        return `${base} · raised by SillyNovel from ${figures.authorReserveTokens.toLocaleString()} in your API settings`;
+    }
+
+    return `${base} · ${RESERVE_SOURCE_LABEL[figures.reserveSource] ?? 'source unknown'}`;
+}
 
 /** @param {HTMLElement} panel */
 function isInspectorOpen(panel) {
@@ -1457,8 +1485,10 @@ function figuresFromPrompt(prompt) {
     return {
         contextTokens: prompt.contextTokens,
         reserveTokens: prompt.reserveTokens,
+        authorReserveTokens: prompt.authorReserveTokens ?? null,
         reserveSource: prompt.reserveSource,
         framingTokens: prompt.framingTokens,
+        profileTokens: prompt.profileTokens ?? null,
         marginTokens: prompt.marginTokens,
         allowanceTokens: prompt.allowanceTokens,
         manuscriptTokens: blockFor(prompt, 'MANUSCRIPT')?.tokens ?? null,
@@ -1482,8 +1512,10 @@ function figuresFromBudget(budget) {
     return {
         contextTokens: budget.contextTokens,
         reserveTokens: budget.reserveTokens,
+        authorReserveTokens: budget.authorReserveTokens ?? null,
         reserveSource: budget.reserveSource,
         framingTokens: budget.framingTokens,
+        profileTokens: budget.profileTokens ?? null,
         marginTokens: budget.marginTokens,
         allowanceTokens: budget.allowanceTokens,
         manuscriptTokens: null,
@@ -1513,6 +1545,9 @@ function captureInspection(prompt, target, source, origin) {
     inspection = {
         origin,
         source,
+        // What the profile rendered to at capture time — a string, compared
+        // as a string, so staleness never re-counts anything.
+        profileSource: prompt.profileText ?? '',
         chapterId: target.chapterId,
         generation: target.generation,
         messages: expandForDisplay(prompt.messages).map((message, index) => {
@@ -1575,6 +1610,7 @@ function refusalInspection(panel, error, target, source) {
     inspection = {
         origin: 'built',
         source,
+        profileSource: null,
         chapterId: target.chapterId,
         generation: target.generation,
         messages: [],
@@ -1647,7 +1683,7 @@ async function buildInspection(panel) {
     renderInspection(panel);
 
     try {
-        const prompt = await buildContinuePrompt(source);
+        const prompt = await buildContinuePrompt(source, { profile: readProfileForm(panel) });
 
         // Token counting is async and can round-trip to the server, so the
         // workspace may have moved while it ran. Painting chapter A's prompt
@@ -1708,7 +1744,10 @@ function renderInspectorStale(panel) {
     // ⚠️ A STRING COMPARISON against the snapshot, never a re-measure. This
     // runs on every keystroke, and token counting must not run in the typing
     // path (ARCHITECTURE.md:165-166). Do not "improve" this into a rebuild.
-    stale.hidden = !inspection || !editor || editor.value === inspection.source;
+    const profileUnchanged = inspection?.profileSource === null
+        || renderProfileText(readProfileForm(panel)) === inspection?.profileSource;
+
+    stale.hidden = !inspection || !editor || (editor.value === inspection.source && profileUnchanged);
 }
 
 /** @param {HTMLElement} panel */
@@ -1777,8 +1816,9 @@ function renderInspectorFigures(panel) {
 
     const rows = [
         ['Context size', tokenFigure(figures.contextTokens)],
-        ['Reply reserve', `${tokenFigure(figures.reserveTokens)} · ${RESERVE_SOURCE_LABEL[figures.reserveSource] ?? 'source unknown'}`],
+        ['Reply reserve', reserveFigure(figures)],
         ['Framing', tokenFigure(figures.framingTokens)],
+        ['Writing Profile', figures.profileTokens === 0 ? 'empty — not sent' : tokenFigure(figures.profileTokens)],
         ['Safety margin', tokenFigure(figures.marginTokens)],
         ['Room left for the manuscript', tokenFigure(figures.allowanceTokens)],
         ['Manuscript sent', manuscript],
@@ -2029,6 +2069,254 @@ function wireInspector(panel) {
     renderInspection(panel);
 }
 
+/* --- the Writing Profile (Phase 3 checkpoint 2) --------------------------
+
+   Explicit Save, no idle debounce: the profile is short, edited rarely, and
+   its loss window is "typed but not yet Saved at a crash", which the dirty
+   indicator shows the author the whole time. The recovery module is
+   chapter-keyed with offer/halt semantics that would have to be duplicated
+   for a second document kind — machinery the manuscript earns and this does
+   not. Leave-flushes (close, tab hidden, Ctrl-S inside the region) cover the
+   ordinary ways an edit is abandoned. */
+
+const PROFILE_CONFLICT_MESSAGE = 'The Writing Profile was changed somewhere else since you opened it, so your '
+    + 'edits were not saved. Copy anything you want to keep, then press Reload profile to see the '
+    + 'current version — reloading replaces what is in these fields.';
+
+const PROFILE_TOO_LARGE_MESSAGE = 'This profile is too large to save. Shorten the longest fields — 8 KB each, '
+    + '32 KB for prose examples.';
+
+/** True while a profile save is in flight. Never gates Continue. */
+let profileSaving = false;
+
+/** @param {HTMLElement} panel */
+function profileFieldsOf(panel) {
+    return [...panel.querySelectorAll('.sillynovel-profile-field')];
+}
+
+/**
+ * The profile as the FORM holds it — what is sent, and what is saved.
+ *
+ * Starts from the saved object so unknown keys a newer client wrote survive
+ * the round trip on this side too; the server preserves them regardless.
+ *
+ * @param {HTMLElement} panel
+ */
+function readProfileForm(panel) {
+    const form = { ...(getProfile()?.data ?? {}) };
+
+    for (const field of profileFieldsOf(panel)) {
+        form[field.dataset.field] = field.value;
+    }
+
+    return form;
+}
+
+/** @param {HTMLElement} panel */
+function isProfileDirty(panel) {
+    const saved = getProfile()?.data ?? {};
+
+    // A non-string from a hand-edited file compares as '' and is written back
+    // as '' on the next save — the form cannot hold anything else.
+    return profileFieldsOf(panel).some((field) => field.value !== String(saved[field.dataset.field] ?? ''));
+}
+
+/**
+ * Paint the textareas from the SAVED profile. Called after resolve, after
+ * Reload, and on Discard — never from renderWorkspaceContent, so a chapter
+ * switch cannot clobber unsaved edits in a project-scoped document.
+ *
+ * @param {HTMLElement} panel
+ */
+function renderProfileForm(panel) {
+    const saved = getProfile()?.data ?? {};
+
+    for (const field of profileFieldsOf(panel)) {
+        field.value = String(saved[field.dataset.field] ?? '');
+    }
+
+    renderProfileStatus(panel);
+}
+
+/**
+ * @param {HTMLElement} panel
+ * @param {string} state
+ * @param {string} text
+ */
+function setProfileStatus(panel, state, text) {
+    const status = panel.querySelector('.sillynovel-profile-status');
+
+    if (status) {
+        status.dataset.state = state;
+        status.textContent = text;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function renderProfileStatus(panel) {
+    const save = panel.querySelector('.sillynovel-profile-save');
+    const discard = panel.querySelector('.sillynovel-profile-discard');
+    const reload = panel.querySelector('.sillynovel-profile-reload');
+    const halt = getProfileHalt();
+    const dirty = isProfileDirty(panel);
+
+    if (save) {
+        save.disabled = profileSaving || halt !== null || !dirty;
+    }
+    if (discard) {
+        discard.disabled = profileSaving || !dirty;
+    }
+    if (reload) {
+        reload.hidden = halt === null;
+    }
+
+    if (halt === 'conflict') {
+        setProfileStatus(panel, 'conflict', PROFILE_CONFLICT_MESSAGE);
+    } else if (profileSaving) {
+        setProfileStatus(panel, 'saving', 'Saving…');
+    } else if (dirty) {
+        setProfileStatus(panel, 'dirty', 'Unsaved changes — press Save profile.');
+    } else {
+        setProfileStatus(panel, 'idle', getProfile() ? 'Saved on the server.' : '');
+    }
+}
+
+/** @param {HTMLElement} panel */
+function handleProfileChange(panel) {
+    renderProfileStatus(panel);
+    // The prompt is built from the form, so an edited profile makes a displayed
+    // prompt stale exactly as an edited chapter does.
+    renderInspectorStale(panel);
+}
+
+/**
+ * Save the profile now. Returns 'clean', 'dirty' or 'failed', like autoSave.
+ *
+ * @param {HTMLElement} panel
+ */
+async function saveProfileNow(panel) {
+    if (profileSaving || getProfileHalt() !== null || !isProfileDirty(panel)) {
+        return 'clean';
+    }
+
+    const data = readProfileForm(panel);
+    let outcome = 'failed';
+    let failure = null;
+
+    profileSaving = true;
+    renderProfileStatus(panel);
+
+    try {
+        const result = await saveProfile(data);
+
+        if (result !== null) {
+            outcome = panel.isConnected && isProfileDirty(panel) ? 'dirty' : 'clean';
+        }
+    } catch (error) {
+        failure = error;
+    } finally {
+        profileSaving = false;
+
+        // Live, not captured: after a close and reopen the captured panel is
+        // detached and the REOPENED one is the one holding a disabled button.
+        const live = document.getElementById('sillynovel-panel');
+
+        if (live) {
+            renderProfileStatus(live);
+
+            // A conflict is rendered by the halt above; anything else is a
+            // message that stands until the next edit repaints it.
+            if (failure && getProfileHalt() === null) {
+                setProfileStatus(live, 'error', failure?.status === 413
+                    ? PROFILE_TOO_LARGE_MESSAGE
+                    : (failure?.message ?? 'The profile could not be saved.'));
+            }
+        }
+    }
+
+    return outcome;
+}
+
+/**
+ * Fire-and-forget save of a dirty profile as the author leaves. The result is
+ * discarded by session.js's generation guard where the workspace has moved on;
+ * what matters is that the bytes reach the server.
+ *
+ * @param {HTMLElement} panel
+ */
+function flushProfile(panel) {
+    if (profileSaving || getProfileHalt() !== null || !isProfileDirty(panel)) {
+        return;
+    }
+
+    void saveProfile(readProfileForm(panel)).catch(() => {
+        // Nothing left to tell.
+    });
+}
+
+/** @param {HTMLElement} panel */
+async function reloadProfileNow(panel) {
+    try {
+        await reloadProfile();
+    } catch (error) {
+        if (panel.isConnected) {
+            setProfileStatus(panel, 'error', error?.message ?? 'The profile could not be reloaded.');
+        }
+        return;
+    }
+
+    const live = document.getElementById('sillynovel-panel');
+
+    if (live) {
+        renderProfileForm(live);
+        renderInspectorStale(live);
+    }
+}
+
+/**
+ * Wire the region's controls. Called once per mount, like wireInspector.
+ *
+ * @param {HTMLElement} panel
+ */
+function wireProfile(panel) {
+    const toggle = panel.querySelector('.sillynovel-profile-toggle');
+    const body = panel.querySelector('.sillynovel-profile-body');
+
+    if (toggle && body) {
+        // Set explicitly rather than relying on the template's `hidden`
+        // surviving DOMPurify, so "collapsed by default" is our guarantee.
+        body.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+
+        toggle.onclick = () => {
+            const open = toggle.getAttribute('aria-expanded') === 'true';
+            toggle.setAttribute('aria-expanded', String(!open));
+            body.hidden = open;
+        };
+    }
+
+    for (const field of profileFieldsOf(panel)) {
+        field.addEventListener('input', () => { handleProfileChange(panel); });
+    }
+
+    const save = panel.querySelector('.sillynovel-profile-save');
+    const discard = panel.querySelector('.sillynovel-profile-discard');
+    const reload = panel.querySelector('.sillynovel-profile-reload');
+
+    if (save) {
+        save.onclick = () => { void saveProfileNow(panel); };
+    }
+    if (discard) {
+        discard.onclick = () => {
+            renderProfileForm(panel);
+            renderInspectorStale(panel);
+        };
+    }
+    if (reload) {
+        reload.onclick = () => { void reloadProfileNow(panel); };
+    }
+}
+
 /**
  * Attach the editor's save triggers. Called once per mount.
  *
@@ -2058,6 +2346,14 @@ function wireEditor(panel) {
         }
 
         event.preventDefault();
+
+        // The document under the cursor: a shortcut pressed inside the profile
+        // saves the profile, and never the chapter it happens to share a panel
+        // with.
+        if (event.target instanceof Element && event.target.closest('.sillynovel-profile')) {
+            void saveProfileNow(panel);
+            return;
+        }
 
         // Under the halt predicate this would silently no-op, and a writer who
         // presses it believes they have saved. Say what is needed instead — but
@@ -2132,6 +2428,7 @@ document.addEventListener('visibilitychange', () => {
 
     if (panel) {
         void autoSave(panel);
+        flushProfile(panel);
     }
 });
 
@@ -2171,6 +2468,10 @@ export function flushOnClose() {
     // offer is pending.
     recordDraft(editorOf(panel)?.value ?? '');
 
+    // The profile has its own halt and its own dirtiness; a chapter's halt
+    // must not stop it from reaching the server.
+    flushProfile(panel);
+
     if (getHalt() !== null || !isDirty(panel)) {
         return;
     }
@@ -2201,6 +2502,8 @@ export async function renderWorkspace(panel) {
         }
 
         wireInspector(panel);
+        wireProfile(panel);
+        renderProfileForm(panel);
         wireEditor(panel);
 
         const newChapter = panel.querySelector('.sillynovel-new-chapter');

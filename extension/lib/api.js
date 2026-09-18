@@ -31,7 +31,8 @@ export const ApiErrorKind = {
     /** The plugin answered with an error code. */
     REQUEST: 'request',
     /**
-     * 412: the chapter changed somewhere else since we read it. Distinct from
+     * 412: the document — a chapter, or the Writing Profile — changed somewhere
+     * else since we read it. Distinct from
      * REQUEST because PLAN.md requires a conflict WARNING rather than a generic
      * failure — the author's unsaved words are at stake, not a retryable call.
      */
@@ -143,7 +144,7 @@ async function request(method, path, body, extraHeaders) {
     if (response.status === 412) {
         throw new ApiError(
             ApiErrorKind.CONFLICT,
-            'This chapter was changed somewhere else since you opened it.',
+            'This was changed somewhere else since you opened it.',
             { status: 412, code: json?.error ?? null },
         );
     }
@@ -228,12 +229,21 @@ export async function getChapter(projectId, chapterId) {
 }
 
 /**
- * Replace a chapter's prose, as a compare-and-swap.
+ * The ONE place a revision gets quoted for the wire.
  *
- * ⚠️ THIS IS THE ONLY PLACE THE REVISION GETS QUOTED. State holds the bare
- * digest (see requireEtag); parseIfMatch accepts only `"<64-hex>"` and answers
- * 400 for an unquoted value, 428 for a missing one. Keeping the quoting here
- * means exactly one function has to be right about it.
+ * State holds the bare digest (see requireEtag); parseIfMatch accepts only
+ * `"<64-hex>"` and answers 400 for an unquoted value, 428 for a missing one.
+ * Every compare-and-swap wrapper calls this, so exactly one function has to be
+ * right about it.
+ *
+ * @param {string} etag bare 64-hex digest
+ */
+function quoteEtag(etag) {
+    return `"${etag}"`;
+}
+
+/**
+ * Replace a chapter's prose, as a compare-and-swap.
  *
  * The response carries {id, etag} and NO content — the new digest must replace
  * the stored one, or the next save compares against a revision the server has
@@ -250,8 +260,57 @@ export async function putChapter(projectId, chapterId, content, etag) {
         'PUT',
         `/projects/${projectId}/chapters/${chapterId}`,
         { content },
-        { 'If-Match': `"${etag}"` },
+        { 'If-Match': quoteEtag(etag) },
     );
 
     return { ...payload, etag: requireEtag(payload, 'the saved chapter') };
+}
+
+/** @param {object} payload @param {string} what */
+function requireProfile(payload, what) {
+    const profile = payload?.profile;
+
+    if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+        throw new ApiError(
+            ApiErrorKind.CONTRACT,
+            `SillyNovel storage returned ${what} without a usable profile document.`,
+        );
+    }
+
+    return profile;
+}
+
+/**
+ * The project's Writing Profile. An absent file reads as the default profile
+ * with the etag of its canonical serialization, so a first run needs no
+ * special case here — 404 on this route means the project is gone.
+ *
+ * @param {string} projectId
+ * @returns {Promise<{profile: object, etag: string}>}
+ */
+export async function getProfile(projectId) {
+    const payload = await request('GET', `/projects/${projectId}/profile`);
+    return { profile: requireProfile(payload, 'the writing profile'), etag: requireEtag(payload, 'the writing profile') };
+}
+
+/**
+ * Replace the Writing Profile, as a compare-and-swap. Known fields are
+ * replaced (absent = empty); unknown keys the server already holds survive
+ * unless this body carries them. The whole object read is sent back, so the
+ * client round-trips unknown keys too.
+ *
+ * @param {string} projectId
+ * @param {object} profile
+ * @param {string} etag bare 64-hex digest
+ * @returns {Promise<{profile: object, etag: string}>}
+ */
+export async function putProfile(projectId, profile, etag) {
+    const payload = await request(
+        'PUT',
+        `/projects/${projectId}/profile`,
+        { profile },
+        { 'If-Match': quoteEtag(etag) },
+    );
+
+    return { profile: requireProfile(payload, 'the saved profile'), etag: requireEtag(payload, 'the saved profile') };
 }

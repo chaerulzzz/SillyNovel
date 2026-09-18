@@ -241,9 +241,10 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-workspace-ready {
     display: grid;
     grid-template-columns: minmax(140px, 200px) minmax(0, 1fr) minmax(160px, 240px);
-    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) auto auto;
     grid-template-areas:
         "nav editor suggestions"
+        "profile profile profile"
         "inspector inspector inspector";
     gap: 12px;
     height: 100%;
@@ -260,8 +261,9 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
             "nav"
             "editor"
             "suggestions"
+            "profile"
             "inspector";
-        grid-template-rows: auto minmax(160px, 1fr) auto auto;
+        grid-template-rows: auto minmax(160px, 1fr) auto auto auto;
         overflow-y: auto;
     }
 
@@ -307,6 +309,7 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-chapter-entry,
 .sillynovel-new-chapter,
 .sillynovel-inspector-toggle,
+.sillynovel-profile-toggle,
 .sillynovel-inline-retry {
     background: none;
     border: 1px solid transparent;
@@ -323,9 +326,11 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-chapter-entry:hover,
 .sillynovel-new-chapter:hover,
 .sillynovel-inspector-toggle:hover,
+.sillynovel-profile-toggle:hover,
 .sillynovel-chapter-entry:focus-visible,
 .sillynovel-new-chapter:focus-visible,
-.sillynovel-inspector-toggle:focus-visible {
+.sillynovel-inspector-toggle:focus-visible,
+.sillynovel-profile-toggle:focus-visible {
     background-color: var(--white20a);
 }
 
@@ -427,6 +432,90 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-suggestions-empty {
     opacity: 0.7;
     font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+/* --- writing profile (Phase 3) --- */
+
+.sillynovel-profile {
+    grid-area: profile;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    padding-top: 8px;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+/* Declared after the base rule for the same reason as the inspector's. */
+@media (max-width: 1000px) {
+    .sillynovel-profile {
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+
+.sillynovel-profile-toggle {
+    border-color: var(--SmartThemeBorderColor);
+    width: auto;
+}
+
+.sillynovel-profile-body {
+    padding-top: 8px;
+}
+
+.sillynovel-profile-note {
+    margin: 0 0 8px;
+    opacity: 0.7;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.sillynovel-profile-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.sillynovel-profile-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.85;
+}
+
+.sillynovel-profile-label-wide {
+    grid-column: 1 / -1;
+}
+
+.sillynovel-profile-field {
+    resize: vertical;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background-color: var(--black30a);
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    line-height: 1.5;
+    opacity: 1;
+}
+
+.sillynovel-profile-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.sillynovel-profile-status {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.75;
+}
+
+.sillynovel-profile-status[data-state="dirty"],
+.sillynovel-profile-status[data-state="error"],
+.sillynovel-profile-status[data-state="conflict"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
 }
 
 /* --- context inspector --- */
@@ -712,7 +801,10 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-copy,
 .sillynovel-discard,
 .sillynovel-inspector-refresh,
-.sillynovel-inspector-copy {
+.sillynovel-inspector-copy,
+.sillynovel-profile-save,
+.sillynovel-profile-discard,
+.sillynovel-profile-reload {
     width: auto;
     background: none;
     border: 1px solid var(--SmartThemeBorderColor);
@@ -733,8 +825,14 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-discard:hover,
 .sillynovel-inspector-refresh:hover,
 .sillynovel-inspector-copy:hover,
+.sillynovel-profile-save:hover,
+.sillynovel-profile-discard:hover,
+.sillynovel-profile-reload:hover,
 .sillynovel-inspector-refresh:focus-visible,
 .sillynovel-inspector-copy:focus-visible,
+.sillynovel-profile-save:focus-visible,
+.sillynovel-profile-discard:focus-visible,
+.sillynovel-profile-reload:focus-visible,
 .sillynovel-continue:focus-visible,
 .sillynovel-cancel:focus-visible,
 .sillynovel-preflight-confirm:focus-visible,
@@ -748,7 +846,9 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-continue:disabled,
 .sillynovel-insert:disabled,
 .sillynovel-inspector-refresh:disabled,
-.sillynovel-inspector-copy:disabled {
+.sillynovel-inspector-copy:disabled,
+.sillynovel-profile-save:disabled,
+.sillynovel-profile-discard:disabled {
     opacity: 0.5;
     cursor: default;
 }

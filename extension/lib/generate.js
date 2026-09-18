@@ -43,11 +43,54 @@ export const PROMPT_BLOCKS = [
 
 /** Blocks Phase 2 cannot fill yet, and why. Rendered by checkpoint 9. */
 const DEFERRED_BLOCKS = {
-    'WRITING PROFILE': 'not implemented until Phase 3',
     'ESTABLISHED STORY STATE': 'not implemented until Phase 4',
     LORE: 'not implemented until Phase 4',
     'EARLIER CHAPTERS': 'not implemented until Phase 3',
 };
+
+/**
+ * The Writing Profile's fields, in the order they are rendered into the
+ * `[WRITING PROFILE]` block and laid out in the editor — one table for both, so
+ * the form and the prompt cannot disagree about what a field is called.
+ */
+export const PROFILE_FIELDS = [
+    { key: 'voice', label: 'Voice' },
+    { key: 'genre', label: 'Genre' },
+    { key: 'pov', label: 'Point of view' },
+    { key: 'tense', label: 'Tense' },
+    { key: 'styleInstructions', label: 'Style instructions' },
+    { key: 'proseExamples', label: 'Prose examples' },
+    { key: 'boundaries', label: 'Boundaries' },
+];
+
+/**
+ * The profile as prose-facing text: only the fields that say something, each
+ * labelled, single-line values inline and multi-line ones on their own lines.
+ * Returns '' when every field is blank, which is what excludes the block.
+ *
+ * @param {object|null} profile
+ */
+export function renderProfileText(profile) {
+    if (!profile || typeof profile !== 'object') {
+        return '';
+    }
+
+    const parts = [];
+
+    for (const { key, label } of PROFILE_FIELDS) {
+        const value = typeof profile[key] === 'string' ? profile[key].trim() : '';
+
+        if (!value) {
+            continue;
+        }
+
+        parts.push(value.includes('\n') || key === 'proseExamples'
+            ? `${label}:\n${value}`
+            : `${label}: ${value}`);
+    }
+
+    return parts.join('\n\n');
+}
 
 /** PLAN.md:419 — "Prose continuation only — no preamble, no commentary". */
 const OUTPUT_CONTRACT =
@@ -97,6 +140,26 @@ const PREFLIGHT_TOKENS = 8000;
  * overfill the context rather than underfill it.
  */
 const FALLBACK_RESERVE_TOKENS = 512;
+
+/**
+ * The reply reserve SillyNovel raises a too-small setting to, and the share of
+ * the context it will never exceed doing so (ARCHITECTURE.md §5.1).
+ *
+ * The floor: `deepseek-flash` spends ~2,300 tokens reasoning before its first
+ * word (2,295 and 2,059 across two live runs), then ~300 on prose, and
+ * SillyTavern ships a 300-token reply budget — so on stock settings every author
+ * on a reasoning model fails their first Continue outright. 4,000 is the same
+ * figure the NO_MESSAGE advice has always named.
+ *
+ * The cap is load-bearing: ST's default context is 4k, and reserving 4,000
+ * there would trip the pre-count guard and trade one total failure for another.
+ * Half the context (less the margin) is the most the reply may take, so the cap
+ * reaches the full floor only from ~8,256 tokens of context. Below that
+ * NO_MESSAGE remains the author's signal, and its wording says which lever is
+ * left — see classify().
+ */
+const REPLY_FLOOR_TOKENS = 4000;
+const RESERVE_CAP_FRACTION = 0.5;
 
 export const GenerateErrorKind = {
     /** Nothing to continue from. */
@@ -209,20 +272,62 @@ function readBudget() {
     if (context.mainApi === 'openai') {
         const settings = context.chatCompletionSettings ?? {};
 
-        return {
+        return resolveReserve({
             api: 'openai',
             contextTokens: Number(settings.openai_max_context) || 0,
             reserveTokens: Number(settings.openai_max_tokens) || 0,
             reserveSource: 'provider',
-        };
+        });
     }
 
-    return {
+    return resolveReserve({
         api: context.mainApi,
         contextTokens: Number(context.maxContext) || 0,
         reserveTokens: FALLBACK_RESERVE_TOKENS,
         reserveSource: 'fallback',
-    };
+    });
+}
+
+/**
+ * The conditional floor (ARCHITECTURE.md §5.1), applied INSIDE readBudget so
+ * every consumer — the pre-count guard, the allowance, the refusal figures, the
+ * preflight, the options handed to generateRaw — reads one resolved number.
+ * The number passed and the number reserved must be the same, and resolving
+ * here is what makes that true by construction rather than by discipline.
+ *
+ * Scoped to chat completion. On every other backend TempResponseLength writes
+ * `amount_gen` (script.js:4112-4113) — the author's own generation-length dial —
+ * and the reserve there is our 512-token guess against `maxContext`, on a path
+ * where no reasoning floor was ever measured. We leave it alone.
+ *
+ * `reserveSource` is the single source of truth for whether the reserve was
+ * raised: runContinue passes `responseLength` iff it reads
+ * 'raised-by-sillynovel'. There is deliberately no parallel boolean — one bit in
+ * two places can drift, and the Inspector already renders this field.
+ *
+ * `authorReserveTokens` is what was actually read, kept so the Inspector can say
+ * "raised from 300 to 1,920" rather than only the resolved figure.
+ *
+ * @param {{api: string, contextTokens: number, reserveTokens: number, reserveSource: string}} read
+ */
+function resolveReserve(read) {
+    const keep = { ...read, authorReserveTokens: read.reserveTokens };
+
+    if (read.api !== 'openai' || read.reserveTokens >= REPLY_FLOOR_TOKENS) {
+        return keep;
+    }
+
+    const cap = Math.floor((read.contextTokens - MARGIN_TOKENS) * RESERVE_CAP_FRACTION);
+    const reserve = Math.min(REPLY_FLOOR_TOKENS, cap);
+
+    // A context too small for the cap to improve on the author's own setting
+    // (including one so small the cap is non-positive) keeps their setting; the
+    // pre-count guard then refuses with their figures, not ours.
+    if (reserve <= read.reserveTokens) {
+        return keep;
+    }
+
+    return { ...keep, reserveTokens: reserve, reserveSource: 'raised-by-sillynovel' };
 }
 
 /**
@@ -236,10 +341,12 @@ function readBudget() {
  * @param {number|null} framingTokens null when nothing had been counted yet
  * @param {number|null} allowanceTokens null when the refusal came first
  */
-function refusalFigures(budget, framingTokens, allowanceTokens) {
+function refusalFigures(budget, framingTokens, allowanceTokens, profileTokens = null) {
     return {
+        profileTokens,
         contextTokens: budget.contextTokens,
         reserveTokens: budget.reserveTokens,
+        authorReserveTokens: budget.authorReserveTokens,
         reserveSource: budget.reserveSource,
         marginTokens: MARGIN_TOKENS,
         framingTokens,
@@ -355,13 +462,16 @@ function countWords(text) {
  * failure mode.
  *
  * @param {string} manuscript what the EDITOR holds, not the saved copy
+ * @param {{profile?: object|null}} [options] the Writing Profile as the FORM
+ *   holds it, not the saved copy — the same principle as the manuscript: what
+ *   is on screen is what is sent, and the dirty indicator is about persistence
  * @returns {Promise<{messages: Array<{role: string, content: string}>,
  *   blocks: Array<object>, inputTokens: number, framingTokens: number,
  *   reserveTokens: number, reserveSource: string, contextTokens: number,
  *   allowanceTokens: number, marginTokens: number, trimmed: boolean,
  *   sentWords: number, totalWords: number}>}
  */
-export async function buildContinuePrompt(manuscript) {
+export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
     const text = typeof manuscript === 'string' ? manuscript : '';
 
     if (text.trim() === '') {
@@ -383,7 +493,7 @@ export async function buildContinuePrompt(manuscript) {
             `There is no room to send this chapter: the reply reserve (${budget.reserveTokens} tokens) `
             + `leaves nothing inside the context size (${budget.contextTokens} tokens). `
             + 'Lower the response length or raise the context size in your API settings.',
-            { budget: refusalFigures(budget, null, null) },
+            { budget: refusalFigures(budget, null, null, null) },
         );
     }
 
@@ -399,16 +509,35 @@ export async function buildContinuePrompt(manuscript) {
         `${instructionBlock}\n\n${contractBlock}\n\n${renderBlock('MANUSCRIPT', '')}`,
     );
 
-    const allowance = budget.contextTokens - budget.reserveTokens - framingTokens - MARGIN_TOKENS;
+    // The Writing Profile is never dropped (ARCHITECTURE.md §5), so like the
+    // framing it comes off the top of the allowance — but it is counted on its
+    // own, ONCE and only when non-empty, rather than folded into framingTokens.
+    // Folding would make the Inspector's Framing row jump whenever the profile
+    // changed with no row explaining why, and the block's own count would be
+    // reported twice.
+    const profileText = renderProfileText(profile);
+    const profileBlock = profileText ? renderBlock('WRITING PROFILE', profileText) : '';
+    const profileTokens = profileText ? await countTokens(profileBlock) : 0;
+
+    const allowance = budget.contextTokens - budget.reserveTokens - framingTokens - profileTokens - MARGIN_TOKENS;
 
     // Reachable when the reserve leaves a sliver that the framing then eats.
+    // The profile is named as a cause only when removing it would actually
+    // have made room — blaming it otherwise sends the author to shorten
+    // something that was not the problem.
     if (allowance <= 0) {
+        const profileToBlame = profileTokens > 0 && allowance + profileTokens > 0;
         throw new GenerateError(
             GenerateErrorKind.BUDGET,
-            `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens) and the `
-            + `instructions leave nothing inside the context size (${budget.contextTokens} tokens). `
-            + 'Lower the response length or raise the context size in your API settings.',
-            { budget: refusalFigures(budget, framingTokens, allowance) },
+            profileToBlame
+                ? `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens), `
+                    + `the Writing Profile (${profileTokens} tokens) and the instructions leave nothing inside `
+                    + `the context size (${budget.contextTokens} tokens). Shorten the Writing Profile, lower the `
+                    + 'response length, or raise the context size in your API settings.'
+                : `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens) and the `
+                    + `instructions leave nothing inside the context size (${budget.contextTokens} tokens). `
+                    + 'Lower the response length or raise the context size in your API settings.',
+            { budget: refusalFigures(budget, framingTokens, allowance, profileTokens) },
         );
     }
 
@@ -418,12 +547,21 @@ export async function buildContinuePrompt(manuscript) {
         throw new GenerateError(
             GenerateErrorKind.BUDGET,
             `This chapter will not fit: even its last ${allowance} tokens of room cannot be filled safely. `
-            + 'Lower the response length or raise the context size in your API settings.',
-            { budget: refusalFigures(budget, framingTokens, allowance) },
+            + 'Lower the response length or raise the context size in your API settings.'
+            + (profileTokens >= allowance
+                ? ` The Writing Profile alone costs ${profileTokens} tokens — shortening it is the quickest fix.`
+                : ''),
+            { budget: refusalFigures(budget, framingTokens, allowance, profileTokens) },
         );
     }
 
     const blocks = PROMPT_BLOCKS.map((label) => {
+        if (label === 'WRITING PROFILE') {
+            return profileText
+                ? { label, included: true, reason: 'included — never dropped', tokens: profileTokens, content: profileText }
+                : { label, included: false, reason: 'profile is empty', content: '' };
+        }
+
         if (label === 'MANUSCRIPT') {
             return {
                 label,
@@ -452,7 +590,13 @@ export async function buildContinuePrompt(manuscript) {
     // completion createRawPrompt adds no speaker prefixes to either
     // (script.js:3885), which is exactly why PLAN.md:440 supports and tests a
     // chat-completion provider.
+    // The profile leads: it is the persistent frame everything after it is read
+    // through, and chat models treat the leading system message that way. The
+    // directive stays last because recency weights it. Order remains a tunable
+    // (§3), and the Inspector's numbered wire list is what makes a re-tune
+    // visible.
     const messages = [
+        ...(profileBlock ? [{ role: 'system', content: profileBlock }] : []),
         { role: 'user', content: renderBlock('MANUSCRIPT', fitted.text) },
         { role: 'system', content: instructionBlock },
         { role: 'system', content: contractBlock },
@@ -461,9 +605,12 @@ export async function buildContinuePrompt(manuscript) {
     return {
         messages,
         blocks,
-        inputTokens: framingTokens + fitted.tokens,
+        inputTokens: framingTokens + profileTokens + fitted.tokens,
         framingTokens,
+        profileTokens,
+        profileText,
         reserveTokens: budget.reserveTokens,
+        authorReserveTokens: budget.authorReserveTokens,
         reserveSource: budget.reserveSource,
         contextTokens: budget.contextTokens,
         allowanceTokens: allowance,
@@ -540,8 +687,10 @@ export function needsPreflight(prompt) {
  * a generic failure with Retry rather than a crash.
  *
  * @param {unknown} error
+ * @param {object|null} prompt the buildContinuePrompt() result that was sent, so
+ *   NO_MESSAGE can name the lever that is actually left
  */
-function classify(error) {
+function classify(error, prompt = null) {
     const message = String(error?.message ?? error ?? '');
 
     if (message === 'No message generated') {
@@ -561,14 +710,35 @@ function classify(error) {
         // This message is the author's only clue, because generateRaw throws a
         // bare Error — the usage figures that would let us diagnose it for them
         // never reach us.
-        return new GenerateError(
-            GenerateErrorKind.NO_MESSAGE,
-            'The model returned no prose — it used the entire reply budget thinking and ran out '
-            + 'before writing. Raise the response length in your API settings: a reasoning model '
-            + 'can spend a few thousand tokens before its first word, so it needs room for both. '
-            + 'Around 4000 is a reasonable starting point.',
-            { cause: error },
-        );
+        //
+        // Three cases, because once the floor has fired the response-length
+        // setting is no longer the lever. If we already raised it as far as the
+        // context allows, the context size is; if we raised it to the full
+        // floor and the model still ran out, only their own setting above the
+        // floor will do.
+        const lead = 'The model returned no prose — it used the entire reply budget thinking and '
+            + 'ran out before writing. ';
+        let advice = 'Raise the response length in your API settings: a reasoning model can spend '
+            + 'a few thousand tokens before its first word, so it needs room for both. Around '
+            + '4000 is a reasonable starting point.';
+
+        if (prompt?.reserveSource === 'raised-by-sillynovel') {
+            const author = Number(prompt.authorReserveTokens).toLocaleString();
+            const reserve = Number(prompt.reserveTokens).toLocaleString();
+
+            advice = prompt.reserveTokens < REPLY_FLOOR_TOKENS
+                ? `SillyNovel already raised the reply budget from your ${author} to ${reserve} tokens `
+                    + `— the most a ${Number(prompt.contextTokens).toLocaleString()}-token context can `
+                    + 'spare — so the response length setting is not the lever here. Raise the '
+                    + 'context size in your API settings; from about 8,300 tokens SillyNovel can '
+                    + 'reserve the full 4,000.'
+                : `SillyNovel already raised the reply budget from your ${author} to 4,000 tokens `
+                    + 'and the model still ran out, so it needs more than that. Set the response '
+                    + 'length above 4,000 in your API settings — once your own setting is at least '
+                    + 'that high, SillyNovel leaves it alone.';
+        }
+
+        return new GenerateError(GenerateErrorKind.NO_MESSAGE, lead + advice, { cause: error });
     }
 
     if (error?.name === 'AbortError' || message.startsWith('Cancelled by')) {
@@ -606,7 +776,7 @@ export async function runContinue({ prompt, chapterId, chapterTitle, generation 
 
     const context = SillyTavern.getContext();
 
-    const promise = context.generateRaw({
+    const options = {
         // A FRESH array of fresh objects: createRawPrompt mutates the messages
         // it is handed in place (script.js:3886), so handing it the array we
         // also hand the Inspector would rewrite what the Inspector shows.
@@ -620,33 +790,35 @@ export async function runContinue({ prompt, chapterId, chapterTitle, generation 
         // silently cut — and an emptied reply then surfaces as the completely
         // unrelated "No message generated".
         trimNames: false,
+    };
 
-        // responseLength is not passed YET. The decision is settled and
-        // documented (ARCHITECTURE.md §5): a conditional floor, scoped to
-        // chat completion, raising the reserve only when the author's own
-        // setting sits below it and only as far as the context affords —
-        // implemented as the first item of Phase 3, not here, so Phase 2 closes
-        // on the generation path it was verified against.
-        //
-        // The hazard is narrower than it first looked. TempResponseLength
-        // (script.js:4094) stashes the author's setting in one static field, so
-        // two overlapping overrides strand openai_max_tokens at ours; but the
-        // override never spans the network call (restore runs at :3995/4000/4005
-        // before the fetch, and on the openai path via the
-        // CHAT_COMPLETION_SETTINGS_READY hook at openai.js:3052, before the
-        // fetch at :3055), our single-flight means we cannot race ourselves, and
-        // ST's own generateQuietPrompt takes the same risk at :3045-3057.
-        // Scoping to chat completion keeps amount_gen — the author's own
-        // generation-length dial on every other backend (:4112-4113) — out of
-        // it entirely.
-        //
-        // ⚠️ When it lands, the number passed and the number reserved must be
-        // the SAME: readBudget().reserveTokens IS openai_max_tokens, so
-        // budgeting against one figure while requesting another would silently
-        // overfill the context. NO_MESSAGE stays either way — below roughly an
-        // 8.2k context the cap cannot reach the floor, and naming a setting the
-        // author can change is then their only signal.
-    });
+    // responseLength is passed iff the reserve was raised (ARCHITECTURE.md
+    // §5.1), and the key is ADDED rather than set to undefined so anything
+    // inspecting the options sees it absent. prompt.reserveTokens is the same
+    // figure the allowance was computed from, because readBudget() resolves the
+    // floor before any arithmetic — the number passed and the number reserved
+    // cannot differ.
+    //
+    // What ST does with it: TempResponseLength.save (script.js:3963) swaps
+    // openai_max_tokens for ours, createGenerationParameters reads it once
+    // (openai.js:2750), and the CHAT_COMPLETION_SETTINGS_READY hook restores it
+    // at openai.js:3052 — before the fetch at :3055, so the override never
+    // spans the network call. The finally at script.js:4050 is the backstop
+    // for throw and abort. The window is prompt assembly only, but it is not
+    // purely ours: other extensions' CHAT_COMPLETION_PROMPT_READY listeners
+    // (script.js:3978) run inside it, so "milliseconds" holds only while none
+    // of them does slow work there.
+    //
+    // saveSettings (script.js:7992) refuses to serialize while an override is
+    // live and reschedules a second later; session.js arms that timer on every
+    // chapter open. Worst case is the settings persisting ~1 s late — and, the
+    // point of that guard, oai_settings is never written to disk holding our
+    // number.
+    if (prompt.reserveSource === 'raised-by-sillynovel') {
+        options.responseLength = prompt.reserveTokens;
+    }
+
+    const promise = context.generateRaw(options);
 
     active = { promise, chapterId, chapterTitle, generation };
 
@@ -655,7 +827,7 @@ export async function runContinue({ prompt, chapterId, chapterTitle, generation 
         return { text, chapterId, generation };
     } catch (error) {
         console.error(`[${EXTENSION_NAME}] generation failed`, error);
-        throw classify(error);
+        throw classify(error, prompt);
     } finally {
         // Only retire our own entry.
         if (active?.promise === promise) {
