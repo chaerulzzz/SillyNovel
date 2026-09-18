@@ -1,10 +1,10 @@
 <!--
     SillyNovel — Writing Workspace body.
 
-    Phase 2, checkpoints 5-6: the five regions the shell provides — chapter
+    Phase 2, checkpoints 5-8: the five regions the shell provides — chapter
     navigation, editor, save status, suggestion pane, and a Context Inspector
-    region. The editor saves as of checkpoint 6; the suggestion pane fills in 8
-    and the Inspector in 9.
+    region. The editor saves as of checkpoint 6, the recovery offer arrived in 7,
+    Continue fills the suggestion pane in 8, and the Inspector fills in 9.
 
     Region visibility is driven from view.js rather than trusted to these
     attributes: this markup passes through DOMPurify on the way in.
@@ -21,14 +21,66 @@
 
         <div class="sillynovel-editor-column">
             <h5 class="sillynovel-chapter-title"></h5>
+
+            <!--
+                Recovery offer (checkpoint 7). Shown when the browser holds
+                writing the server never received. The editor shows the draft;
+                this offers the saved version instead. Nothing reaches the
+                server until the author chooses.
+            -->
+            <div class="sillynovel-recovery" role="status" hidden>
+                <p class="sillynovel-recovery-message"></p>
+                <div class="sillynovel-recovery-actions">
+                    <button type="button" class="sillynovel-recovery-keep">Keep my writing</button>
+                    <button type="button" class="sillynovel-recovery-discard">Use the saved version</button>
+                </div>
+            </div>
+
             <!-- Writable as of checkpoint 6; autosave lives in view.js. -->
             <textarea class="sillynovel-editor" spellcheck="false"></textarea>
             <p class="sillynovel-save-status" role="status"></p>
+
+            <!--
+                Continue (checkpoint 8). One model request at a time: the button
+                is replaced by Cancel while one runs, including while the author
+                is looking at a different chapter.
+            -->
+            <div class="sillynovel-actions">
+                <button type="button" class="sillynovel-continue">Continue</button>
+                <button type="button" class="sillynovel-cancel" hidden>Cancel</button>
+                <span class="sillynovel-action-note" role="status"></span>
+            </div>
+
+            <p class="sillynovel-trim-note" hidden></p>
+
+            <!--
+                Cost preflight (AGENTS.md rule 6). Above the threshold the click
+                does not send: these numbers are shown first and nothing leaves
+                the browser until Send is pressed.
+            -->
+            <div class="sillynovel-preflight" hidden>
+                <p class="sillynovel-preflight-message"></p>
+                <div class="sillynovel-preflight-actions">
+                    <button type="button" class="sillynovel-preflight-confirm">Send it</button>
+                    <button type="button" class="sillynovel-preflight-cancel">Not now</button>
+                </div>
+            </div>
         </div>
 
         <aside class="sillynovel-suggestions" aria-label="Suggestions">
             <h5>Suggestions</h5>
             <p class="sillynovel-suggestions-empty">Generated suggestions appear here. Nothing is ever inserted into the manuscript on its own.</p>
+            <p class="sillynovel-suggestions-status" role="status" hidden></p>
+
+            <div class="sillynovel-suggestion" hidden>
+                <p class="sillynovel-suggestion-stale" hidden>The chapter changed after this was generated, so it may no longer follow on.</p>
+                <div class="sillynovel-suggestion-text"></div>
+                <div class="sillynovel-suggestion-actions">
+                    <button type="button" class="sillynovel-insert">Insert</button>
+                    <button type="button" class="sillynovel-copy">Copy</button>
+                    <button type="button" class="sillynovel-discard">Discard</button>
+                </div>
+            </div>
         </aside>
 
         <section class="sillynovel-inspector" aria-label="Context Inspector">

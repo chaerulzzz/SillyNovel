@@ -515,3 +515,162 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-editor[readonly] {
     opacity: 0.85;
 }
+
+/* --- Recovery offer (checkpoint 7) -------------------------------------- */
+
+/* The author's unsaved writing is on screen but stored nowhere durable yet, so
+   this is the one region in the editor column that should be hard to miss. */
+.sillynovel-recovery {
+    flex: 0 0 auto;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background-color: var(--white20a);
+}
+
+.sillynovel-recovery-message {
+    margin: 0 0 8px;
+}
+
+.sillynovel-recovery-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sillynovel-recovery-keep,
+.sillynovel-recovery-discard {
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 5px 10px;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.sillynovel-recovery-keep:hover,
+.sillynovel-recovery-discard:hover,
+.sillynovel-recovery-keep:focus-visible,
+.sillynovel-recovery-discard:focus-visible {
+    background-color: var(--white30a);
+}
+
+/* --- Continue, preflight, suggestions (checkpoint 8) --------------------- */
+
+.sillynovel-actions {
+    flex: 0 0 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.sillynovel-continue,
+.sillynovel-cancel,
+.sillynovel-preflight-confirm,
+.sillynovel-preflight-cancel,
+.sillynovel-insert,
+.sillynovel-copy,
+.sillynovel-discard {
+    width: auto;
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 5px 12px;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+.sillynovel-continue:hover,
+.sillynovel-cancel:hover,
+.sillynovel-preflight-confirm:hover,
+.sillynovel-preflight-cancel:hover,
+.sillynovel-insert:hover,
+.sillynovel-copy:hover,
+.sillynovel-discard:hover,
+.sillynovel-continue:focus-visible,
+.sillynovel-cancel:focus-visible,
+.sillynovel-preflight-confirm:focus-visible,
+.sillynovel-preflight-cancel:focus-visible,
+.sillynovel-insert:focus-visible,
+.sillynovel-copy:focus-visible,
+.sillynovel-discard:focus-visible {
+    background-color: var(--white30a);
+}
+
+.sillynovel-continue:disabled,
+.sillynovel-insert:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.sillynovel-action-note,
+.sillynovel-trim-note {
+    margin: 0;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.75;
+    overflow-wrap: anywhere;
+}
+
+.sillynovel-action-note[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+/* Cost preflight — AGENTS.md rule 6. Nothing has been sent at this point, so
+   this has to read as a question rather than as a progress message. */
+.sillynovel-preflight {
+    flex: 0 0 auto;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background-color: var(--white20a);
+}
+
+.sillynovel-preflight-message {
+    margin: 0 0 8px;
+    white-space: pre-line;
+}
+
+.sillynovel-preflight-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sillynovel-suggestions-status[data-state="error"] {
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+.sillynovel-suggestion-stale {
+    margin: 0 0 6px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    color: var(--SmartThemeQuoteColor, inherit);
+}
+
+/* pre-wrap, because the prose is set with textContent — never innerHTML — and
+   paragraph breaks have to survive that. */
+.sillynovel-suggestion-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.6;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background-color: var(--black30a);
+}
+
+.sillynovel-suggestion-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.sillynovel-inline-retry + .sillynovel-inline-retry {
+    margin-left: 4px;
+}

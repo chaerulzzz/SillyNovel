@@ -11,6 +11,7 @@
  */
 
 import * as api from './api.js';
+import * as recovery from './recovery.js';
 
 const SETTINGS_KEY = 'sillynovel';
 
@@ -108,6 +109,19 @@ const saveInFlight = new Map();
  * @type {{chapterId: string, reason: 'conflict'|'oversize'}|null}
  */
 let halted = null;
+
+/**
+ * A recovery draft waiting for the author to choose, or null.
+ *
+ * While one stands, BOTH writers are suspended: the ~500 ms local write (or the
+ * first keystroke overwrites the very record being offered) and checkpoint 6's
+ * save machine (or the 2 s autosave silently PUTs the draft and overwrites the
+ * saved version the banner is offering). The second is handled by getHalt()
+ * reporting 'offer', so every existing trigger no-ops with no new bypass.
+ *
+ * @type {{chapterId: string, draft: string, kind: 'newer'|'conflict', serverContent: string, serverEtag: string}|null}
+ */
+let pendingOffer = null;
 
 /**
  * The extension's settings bag.
@@ -216,6 +230,10 @@ async function resolve() {
     // A new workspace object: anything captured against the previous one is stale.
     workspaceGeneration += 1;
     halted = null;
+    pendingOffer = null;
+
+    void recovery.pruneOldRecords();
+    pendingOffer = await evaluateOffer(project.id, chapter.id, loaded.content, loaded.etag);
 
     // The listing is now the server's own, so nothing can still be missing from it.
     pendingChapterId = null;
@@ -291,6 +309,11 @@ export async function openChapter(chapterId, token = ++openToken) {
     // This read carries a fresh revision, so whatever halted saving on the way
     // out no longer applies.
     halted = null;
+
+    // ⚠️ Only now, past the token and generation gate above. Evaluating on the
+    // raw read would let a SUPERSEDED read for chapter A raise a banner over
+    // chapter B — the offer belongs to whichever chapter actually installed.
+    pendingOffer = await evaluateOffer(projectId, chapterId, loaded.content, loaded.etag);
 
     remember(projectId, chapterId);
 
@@ -403,12 +426,29 @@ async function settlePendingSave(chapterId) {
 }
 
 /**
+ * The counter a long-running action captures when it starts.
+ *
+ * ⚠️ isCurrentTarget() alone is not enough for callers outside this module: it
+ * CHECKS a captured generation but cannot SUPPLY one, and `workspaceGeneration`
+ * is private. generate.js takes this at click time alongside the chapter id.
+ *
+ * @returns {number}
+ */
+export function getWorkspaceGeneration() {
+    return workspaceGeneration;
+}
+
+/**
  * Is a captured save still speaking for the workspace that is open now?
+ *
+ * Exported as of checkpoint 8: a generation started before a close-and-reopen
+ * must not render into the reopened workspace, and that is the same question
+ * saves already ask. One predicate, not two copies that drift.
  *
  * @param {number} generation
  * @param {string} chapterId
  */
-function isCurrentTarget(generation, chapterId) {
+export function isCurrentTarget(generation, chapterId) {
     return current !== null
         && generation === workspaceGeneration
         && current.chapter.id === chapterId;
@@ -419,11 +459,117 @@ function isCurrentTarget(generation, chapterId) {
  * @returns {'conflict'|'oversize'|null}
  */
 export function getHalt() {
+    // An unresolved recovery offer stops saving as firmly as a conflict does,
+    // and reusing this predicate means idle/blur/visibilitychange/Ctrl-S are all
+    // covered without a second switch to keep in sync.
+    if (pendingOffer && current && pendingOffer.chapterId === current.chapter.id) {
+        return 'offer';
+    }
+
     if (!halted || !current || halted.chapterId !== current.chapter.id) {
         return null;
     }
 
     return halted.reason;
+}
+
+/** @returns {object|null} the draft awaiting a decision on the open chapter */
+export function getPendingOffer() {
+    if (!pendingOffer || !current || pendingOffer.chapterId !== current.chapter.id) {
+        return null;
+    }
+
+    return pendingOffer;
+}
+
+/**
+ * Is there a draft worth offering for this chapter?
+ *
+ * @param {string} projectId
+ * @param {string} chapterId
+ * @param {string} serverContent
+ * @param {string} serverEtag
+ */
+async function evaluateOffer(projectId, chapterId, serverContent, serverEtag) {
+    if (!recovery.isTrusted()) {
+        return null;
+    }
+
+    const record = await recovery.readRecord(projectId, chapterId);
+
+    if (!record || typeof record.content !== 'string') {
+        return null;
+    }
+
+    if (record.content === serverContent) {
+        // Already saved; the record is simply stale.
+        void recovery.deleteRecord(projectId, chapterId);
+        return null;
+    }
+
+    return {
+        chapterId,
+        draft: record.content,
+        // baseEtag says which revision the draft was typed on top of. Unchanged
+        // means the draft is strictly newer; changed means somebody else saved
+        // too, and both sides hold text the other lacks.
+        kind: record.baseEtag === serverEtag ? 'newer' : 'conflict',
+        serverContent,
+        serverEtag,
+    };
+}
+
+/**
+ * Keep the local draft in step with the editor. No-ops while an offer stands.
+ * @param {string} text
+ */
+export function recordDraft(text) {
+    if (!current || pendingOffer) {
+        return;
+    }
+
+    void recovery.writeRecord(current.project.id, current.chapter.id, text, current.etag);
+}
+
+/**
+ * Take the draft. Syncs the record to what is actually on screen BEFORE the
+ * writers resume — the suspension is the one thing that can leave the record
+ * behind the editor, and settleAfterSave() reads a differing record as ahead.
+ *
+ * @param {string} editorText what the editor holds right now
+ * @returns {Promise<boolean>} whether the record invariant is intact
+ */
+export async function acceptOffer(editorText) {
+    const offer = getPendingOffer();
+
+    if (!offer) {
+        return true;
+    }
+
+    const ok = await recovery.syncRecord(
+        current.project.id,
+        offer.chapterId,
+        editorText,
+        offer.serverEtag,
+    );
+
+    pendingOffer = null;
+
+    return ok;
+}
+
+/** Keep the saved version. Deleting the record restores the invariant too. */
+export async function declineOffer() {
+    const offer = getPendingOffer();
+
+    if (!offer) {
+        return;
+    }
+
+    const projectId = current.project.id;
+    pendingOffer = null;
+
+    await recovery.deleteRecord(projectId, offer.chapterId);
 }
 
 /**
@@ -466,6 +612,10 @@ async function performSave(projectId, chapterId, generation, text, etag) {
 
         throw error;
     }
+
+    // Resolve the local copy before the guard below: the record belongs to the
+    // chapter that was saved, whether or not the workspace has moved on.
+    void recovery.settleAfterSave(projectId, chapterId, text, result.etag);
 
     if (!isCurrentTarget(generation, chapterId)) {
         return null;
@@ -550,4 +700,5 @@ export function resetWorkspace() {
     // saveInFlight is deliberately left alone — see its declaration.
     workspaceGeneration += 1;
     halted = null;
+    pendingOffer = null;
 }
