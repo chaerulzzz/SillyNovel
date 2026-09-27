@@ -40,13 +40,12 @@
             <textarea class="sillynovel-editor" spellcheck="false"></textarea>
             <p class="sillynovel-save-status" role="status"></p>
 
-            <!--
-                Continue (checkpoint 8). One model request at a time: the button
-                is replaced by Cancel while one runs, including while the author
-                is looking at a different chapter.
-            -->
             <div class="sillynovel-actions">
-                <button type="button" class="sillynovel-continue">Continue</button>
+                <button type="button" class="sillynovel-action" data-action="continue">Continue</button>
+                <button type="button" class="sillynovel-action" data-action="rewrite">Rewrite selection</button>
+                <button type="button" class="sillynovel-action" data-action="expand">Expand selection</button>
+                <button type="button" class="sillynovel-action" data-action="summarize">Summarize</button>
+                <button type="button" class="sillynovel-action" data-action="brainstorm">Brainstorm</button>
                 <button type="button" class="sillynovel-cancel" hidden>Cancel</button>
                 <span class="sillynovel-action-note" role="status"></span>
             </div>
@@ -87,12 +86,20 @@
 
             <div class="sillynovel-suggestion" hidden>
                 <p class="sillynovel-suggestion-stale" hidden>The chapter changed after this was generated, so it may no longer follow on.</p>
-                <div class="sillynovel-suggestion-text"></div>
-                <div class="sillynovel-suggestion-actions">
-                    <button type="button" class="sillynovel-insert">Insert</button>
-                    <button type="button" class="sillynovel-copy">Copy</button>
-                    <button type="button" class="sillynovel-discard">Discard</button>
+                <div class="sillynovel-suggestion-history" hidden>
+                    <button type="button" class="sillynovel-history-previous">‹ Previous</button>
+                    <span class="sillynovel-history-position"></span>
+                    <button type="button" class="sillynovel-history-next">Next ›</button>
                 </div>
+                <div class="sillynovel-suggestion-original-block" hidden>
+                    <h6>Original</h6>
+                    <div class="sillynovel-suggestion-original"></div>
+                </div>
+                <div class="sillynovel-suggestion-proposed-block">
+                    <h6 class="sillynovel-suggestion-proposed-label" hidden>Proposed</h6>
+                    <div class="sillynovel-suggestion-text"></div>
+                </div>
+                <div class="sillynovel-suggestion-actions"></div>
             </div>
         </aside>
 
@@ -127,7 +134,7 @@
                     <button type="button" class="sillynovel-inspector-copy">Copy prompt</button>
                     <span class="sillynovel-inspector-status" role="status" hidden></span>
                 </div>
-                <p class="sillynovel-inspector-stale" hidden>The chapter changed after this was built, so it is no longer the prompt Continue would send. Refresh to rebuild.</p>
+                <p class="sillynovel-inspector-stale" hidden>The chapter changed after this was built, so it is no longer the prompt this action would send. Refresh to rebuild.</p>
                 <p class="sillynovel-inspector-empty">Nothing built yet. Refresh builds the prompt from what the editor holds right now, without sending anything.</p>
                 <p class="sillynovel-inspector-refusal" role="status" hidden></p>
                 <ul class="sillynovel-inspector-figures" hidden></ul>

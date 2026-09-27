@@ -1,18 +1,18 @@
 /**
  * SillyNovel — prompt assembly, the context budget, and the single model call
- * Phase 2 makes (checkpoint 8).
+ * used by every writing action.
  *
  * Split from view.js so that module stays about the DOM: this one owns what is
  * sent to the model and what comes back. Checkpoint 9's Context Inspector
- * renders exactly what buildContinuePrompt() returns, which is why assembly is a
- * separate export rather than something inlined at the click.
+ * renders exactly what buildPrompt() returns, which is why assembly stays out
+ * of the DOM layer.
  *
  * RULES (see AGENTS.md):
  *  - Generated prose is NEVER auto-inserted into a draft. Nothing here touches
- *    the editor; runContinue() returns text and the author decides.
+ *    the editor; runAction() returns text and the author decides.
  *  - Established state and writing instruction are separate LABELED blocks
  *    (ARCHITECTURE.md §3), never merged into one prose blob.
- *  - Cost preflight before a large operation (rule 6) — buildContinuePrompt
+ *  - Cost preflight before a large operation (rule 6) — buildPrompt
  *    reports the numbers, view.js gates the send on them.
  *
  * Everything below about SillyTavern's behaviour was read from the pinned image
@@ -27,9 +27,8 @@ const EXTENSION_NAME = 'sillynovel-writing';
  * state from writing instruction is the whole point of §3 — but the ORDER is
  * explicitly a tunable, so this list must not be read as pinning it.
  *
- * Phase 2 has data for three of the seven. The other four are still listed,
- * because §5 requires an inclusion or exclusion REASON for every block and a
- * block nobody lists is a block nobody can explain the absence of.
+ * Blocks without data stay listed because §5 requires an inclusion or
+ * exclusion reason for every one.
  */
 export const PROMPT_BLOCKS = [
     'WRITING PROFILE',
@@ -37,6 +36,7 @@ export const PROMPT_BLOCKS = [
     'LORE',
     'EARLIER CHAPTERS',
     'MANUSCRIPT',
+    'SELECTION',
     'CURRENT WRITING INSTRUCTION',
     'OUTPUT CONTRACT',
 ];
@@ -92,15 +92,49 @@ export function renderProfileText(profile) {
     return parts.join('\n\n');
 }
 
-/** PLAN.md:419 — "Prose continuation only — no preamble, no commentary". */
-const OUTPUT_CONTRACT =
-    'Reply with the continuation prose only. No preamble, no commentary, no headings, '
-    + 'no quotation marks around the whole reply, and no restatement of what came before. '
-    + 'Begin exactly where the manuscript stops.';
-
-const CONTINUE_INSTRUCTION =
-    'Continue this chapter from exactly where it stops, in the same voice, tense and point of view. '
-    + 'Write the next passage only.';
+/** One table drives assembly, progress text, result controls and validation. */
+export const ACTIONS = Object.freeze({
+    continue: {
+        label: 'Continue',
+        progress: 'Generating…',
+        resultKind: 'prose',
+        needsSelection: false,
+        instruction: 'Continue this chapter from exactly where it stops, in the same voice, tense and point of view. Write the next passage only.',
+        contract: 'Reply with the continuation prose only. No preamble, no commentary, no headings, no quotation marks around the whole reply, and no restatement of what came before. Begin exactly where the manuscript stops.',
+    },
+    rewrite: {
+        label: 'Rewrite selection',
+        progress: 'Rewriting…',
+        resultKind: 'prose',
+        needsSelection: true,
+        instruction: 'Rewrite the passage in [SELECTION] in the same voice, tense and point of view, keeping its meaning and its place in the chapter. The manuscript is context only.',
+        contract: 'Reply with the replacement passage only. No preamble, no commentary, no headings, no quotation marks around the whole reply, and nothing from outside the selection.',
+    },
+    expand: {
+        label: 'Expand selection',
+        progress: 'Expanding…',
+        resultKind: 'prose',
+        needsSelection: true,
+        instruction: 'Expand the passage in [SELECTION] with more detail, sensation and narrative beats, in the same voice, tense and point of view. It replaces the selection. The manuscript is context only.',
+        contract: 'Reply with the expanded passage only. No preamble, no commentary, no headings, and no quotation marks around the whole reply.',
+    },
+    summarize: {
+        label: 'Summarize',
+        progress: 'Summarizing…',
+        resultKind: 'notes',
+        needsSelection: false,
+        instruction: 'Summarize what happens in this chapter so far: events, who is present, and what changed. These are working notes for the author, not manuscript.',
+        contract: 'Reply with clearly labeled notes only: short paragraphs or bullet points. No prose continuation and no preamble.',
+    },
+    brainstorm: {
+        label: 'Brainstorm',
+        progress: 'Brainstorming…',
+        resultKind: 'notes',
+        needsSelection: false,
+        instruction: 'Brainstorm where this chapter could go next: several distinct directions, each in a sentence or two, with what it would cost or risk. These are working notes for the author, not manuscript.',
+        contract: 'Reply with clearly labeled options only, one per bullet. No prose continuation and no preamble.',
+    },
+});
 
 /**
  * Headroom above everything we counted.
@@ -162,7 +196,7 @@ const REPLY_FLOOR_TOKENS = 4000;
 const RESERVE_CAP_FRACTION = 0.5;
 
 export const GenerateErrorKind = {
-    /** Nothing to continue from. */
+    /** No manuscript, or a selection action without a selection. */
     EMPTY: 'empty',
     /** The context cannot hold the prompt. Never sent. */
     BUDGET: 'budget',
@@ -203,22 +237,23 @@ export class GenerateError extends Error {
  * ⚠️ Module state, and DELIBERATELY not cleared when the panel closes. Closing
  * does not cancel the request (stopGeneration is global — see
  * cancelGeneration), so a request outlives the panel. If teardown cleared this,
- * a reopened panel would show a live Continue button over a generation that is
+ * a reopened panel would show a live action button over a generation that is
  * still costing money, and one click would buy a second one. There is no
  * resetGeneration() export for exactly that reason: it is the function a
  * teardown path would reach for.
  *
- * @type {{promise: Promise<string>, chapterId: string, chapterTitle: string, generation: number}|null}
+ * @type {{promise: Promise<string>, action: string, chapterId: string, chapterTitle: string, generation: number}|null}
  */
 let active = null;
 
-/** @returns {{chapterId: string, chapterTitle: string, generation: number}|null} */
+/** @returns {{action: string, chapterId: string, chapterTitle: string, generation: number}|null} */
 export function getActiveGeneration() {
     if (!active) {
         return null;
     }
 
     return {
+        action: active.action,
         chapterId: active.chapterId,
         chapterTitle: active.chapterTitle,
         generation: active.generation,
@@ -301,7 +336,7 @@ function readBudget() {
  * where no reasoning floor was ever measured. We leave it alone.
  *
  * `reserveSource` is the single source of truth for whether the reserve was
- * raised: runContinue passes `responseLength` iff it reads
+ * raised: runAction passes `responseLength` iff it reads
  * 'raised-by-sillynovel'. There is deliberately no parallel boolean — one bit in
  * two places can drift, and the Inspector already renders this field.
  *
@@ -341,9 +376,18 @@ function resolveReserve(read) {
  * @param {number|null} framingTokens null when nothing had been counted yet
  * @param {number|null} allowanceTokens null when the refusal came first
  */
-function refusalFigures(budget, framingTokens, allowanceTokens, profileTokens = null) {
+function refusalFigures(
+    budget,
+    framingTokens,
+    allowanceTokens,
+    profileTokens = null,
+    selectionTokens = null,
+    action = null,
+) {
     return {
+        action,
         profileTokens,
+        selectionTokens,
         contextTokens: budget.contextTokens,
         reserveTokens: budget.reserveTokens,
         authorReserveTokens: budget.authorReserveTokens,
@@ -449,7 +493,7 @@ function countWords(text) {
 }
 
 /**
- * Assemble the Continue prompt and report what it costs.
+ * Assemble one action prompt and report what it costs.
  *
  * Pure apart from token counting: it reads settings and counts, and touches no
  * module state. Checkpoint 9's Inspector calls it without generating.
@@ -461,23 +505,38 @@ function countWords(text) {
  * numbers that did not produce the displayed prompt is the Inspector's worst
  * failure mode.
  *
- * @param {string} manuscript what the EDITOR holds, not the saved copy
- * @param {{profile?: object|null}} [options] the Writing Profile as the FORM
- *   holds it, not the saved copy — the same principle as the manuscript: what
- *   is on screen is what is sent, and the dirty indicator is about persistence
+ * @param {string} action an ACTIONS key
+ * @param {{manuscript?: string, selection?: string, profile?: object|null}} [input]
+ *   live form values, not saved copies
  * @returns {Promise<{messages: Array<{role: string, content: string}>,
- *   blocks: Array<object>, inputTokens: number, framingTokens: number,
- *   reserveTokens: number, reserveSource: string, contextTokens: number,
- *   allowanceTokens: number, marginTokens: number, trimmed: boolean,
- *   sentWords: number, totalWords: number}>}
+ *   blocks: Array<object>, action: string, inputTokens: number,
+ *   framingTokens: number, profileTokens: number, profileText: string,
+ *   selectionTokens: number, selectionText: string, selectionWords: number,
+ *   reserveTokens: number, authorReserveTokens: number, reserveSource: string,
+ *   contextTokens: number, allowanceTokens: number, marginTokens: number,
+ *   trimmed: boolean, sentWords: number, totalWords: number}>}
  */
-export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
+export async function buildPrompt(action, { manuscript = '', selection = '', profile = null } = {}) {
+    const config = ACTIONS[action];
+
+    if (!config) {
+        throw new TypeError(`Unknown writing action: ${action}`);
+    }
+
     const text = typeof manuscript === 'string' ? manuscript : '';
+    const selectionText = config.needsSelection && typeof selection === 'string' ? selection : '';
 
     if (text.trim() === '') {
         throw new GenerateError(
             GenerateErrorKind.EMPTY,
-            'There is nothing to continue yet. Write a line or two first.',
+            'There is no manuscript yet. Write a line or two first.',
+        );
+    }
+
+    if (config.needsSelection && selectionText.trim() === '') {
+        throw new GenerateError(
+            GenerateErrorKind.EMPTY,
+            `Select a passage to ${action} first.`,
         );
     }
 
@@ -493,12 +552,12 @@ export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
             `There is no room to send this chapter: the reply reserve (${budget.reserveTokens} tokens) `
             + `leaves nothing inside the context size (${budget.contextTokens} tokens). `
             + 'Lower the response length or raise the context size in your API settings.',
-            { budget: refusalFigures(budget, null, null, null) },
+            { budget: refusalFigures(budget, null, null, null, config.needsSelection ? null : 0, action) },
         );
     }
 
-    const instructionBlock = renderBlock('CURRENT WRITING INSTRUCTION', CONTINUE_INSTRUCTION);
-    const contractBlock = renderBlock('OUTPUT CONTRACT', OUTPUT_CONTRACT);
+    const instructionBlock = renderBlock('CURRENT WRITING INSTRUCTION', config.instruction);
+    const contractBlock = renderBlock('OUTPUT CONTRACT', config.contract);
 
     // ⚠️ Counted, not absorbed by MARGIN_TOKENS. These blocks are
     // "included — never dropped", so they come off the top of the allowance;
@@ -509,49 +568,54 @@ export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
         `${instructionBlock}\n\n${contractBlock}\n\n${renderBlock('MANUSCRIPT', '')}`,
     );
 
-    // The Writing Profile is never dropped (ARCHITECTURE.md §5), so like the
-    // framing it comes off the top of the allowance — but it is counted on its
-    // own, ONCE and only when non-empty, rather than folded into framingTokens.
-    // Folding would make the Inspector's Framing row jump whenever the profile
-    // changed with no row explaining why, and the block's own count would be
-    // reported twice.
     const profileText = renderProfileText(profile);
     const profileBlock = profileText ? renderBlock('WRITING PROFILE', profileText) : '';
     const profileTokens = profileText ? await countTokens(profileBlock) : 0;
+    const selectionBlock = selectionText ? renderBlock('SELECTION', selectionText) : '';
+    const selectionTokens = selectionBlock ? await countTokens(selectionBlock) : 0;
 
-    const allowance = budget.contextTokens - budget.reserveTokens - framingTokens - profileTokens - MARGIN_TOKENS;
+    const allowance = budget.contextTokens - budget.reserveTokens - framingTokens
+        - profileTokens - selectionTokens - MARGIN_TOKENS;
 
-    // Reachable when the reserve leaves a sliver that the framing then eats.
-    // The profile is named as a cause only when removing it would actually
-    // have made room — blaming it otherwise sends the author to shorten
-    // something that was not the problem.
     if (allowance <= 0) {
         const profileToBlame = profileTokens > 0 && allowance + profileTokens > 0;
+        const selectionToBlame = selectionTokens > 0 && allowance + selectionTokens > 0;
+        const namedCosts = [
+            ...(profileToBlame ? [`the Writing Profile (${profileTokens} tokens)`] : []),
+            ...(selectionToBlame ? [`the selected passage (${selectionTokens} tokens)`] : []),
+        ];
+        const remedies = [
+            ...(profileToBlame ? ['shorten the Writing Profile'] : []),
+            ...(selectionToBlame ? ['shorten the selected passage'] : []),
+            'lower the response length',
+            'raise the context size in your API settings',
+        ];
+
         throw new GenerateError(
             GenerateErrorKind.BUDGET,
-            profileToBlame
-                ? `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens), `
-                    + `the Writing Profile (${profileTokens} tokens) and the instructions leave nothing inside `
-                    + `the context size (${budget.contextTokens} tokens). Shorten the Writing Profile, lower the `
-                    + 'response length, or raise the context size in your API settings.'
-                : `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens) and the `
-                    + `instructions leave nothing inside the context size (${budget.contextTokens} tokens). `
-                    + 'Lower the response length or raise the context size in your API settings.',
-            { budget: refusalFigures(budget, framingTokens, allowance, profileTokens) },
+            `There is no room left for the chapter: the reply reserve (${budget.reserveTokens} tokens)`
+                + (namedCosts.length ? `, ${namedCosts.join(' and ')},` : '')
+                + ` and the instructions leave nothing inside the context size (${budget.contextTokens} tokens). `
+                + `Try to ${remedies.join(', or ')}.`,
+            { budget: refusalFigures(budget, framingTokens, allowance, profileTokens, selectionTokens, action) },
         );
     }
 
     const fitted = await fitManuscript(text, allowance);
 
     if (!fitted) {
+        const quickest = selectionTokens >= allowance
+            ? ` The selected passage alone costs ${selectionTokens} tokens — shortening it is the quickest fix.`
+            : profileTokens >= allowance
+                ? ` The Writing Profile alone costs ${profileTokens} tokens — shortening it is the quickest fix.`
+                : '';
+
         throw new GenerateError(
             GenerateErrorKind.BUDGET,
             `This chapter will not fit: even its last ${allowance} tokens of room cannot be filled safely. `
             + 'Lower the response length or raise the context size in your API settings.'
-            + (profileTokens >= allowance
-                ? ` The Writing Profile alone costs ${profileTokens} tokens — shortening it is the quickest fix.`
-                : ''),
-            { budget: refusalFigures(budget, framingTokens, allowance, profileTokens) },
+            + quickest,
+            { budget: refusalFigures(budget, framingTokens, allowance, profileTokens, selectionTokens, action) },
         );
     }
 
@@ -574,41 +638,44 @@ export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
             };
         }
 
+        if (label === 'SELECTION') {
+            return selectionText
+                ? { label, included: true, reason: 'included — never dropped', tokens: selectionTokens, content: selectionText }
+                : { label, included: false, reason: 'this action takes no selection', content: '' };
+        }
+
         if (label === 'CURRENT WRITING INSTRUCTION') {
-            return { label, included: true, reason: 'included — never dropped', content: CONTINUE_INSTRUCTION };
+            return { label, included: true, reason: 'included — never dropped', content: config.instruction };
         }
 
         if (label === 'OUTPUT CONTRACT') {
-            return { label, included: true, reason: 'included — never dropped', content: OUTPUT_CONTRACT };
+            return { label, included: true, reason: 'included — never dropped', content: config.contract };
         }
 
         return { label, included: false, reason: DEFERRED_BLOCKS[label], content: '' };
     });
 
-    // One message per block, so §3's blocks stay separable rather than becoming
-    // one prose blob. Framing as `system`, manuscript as `user`: under chat
-    // completion createRawPrompt adds no speaker prefixes to either
-    // (script.js:3885), which is exactly why PLAN.md:440 supports and tests a
-    // chat-completion provider.
-    // The profile leads: it is the persistent frame everything after it is read
-    // through, and chat models treat the leading system message that way. The
-    // directive stays last because recency weights it. Order remains a tunable
-    // (§3), and the Inspector's numbered wire list is what makes a re-tune
-    // visible.
+    // The profile frames the request, while manuscript and selection remain
+    // separate user-authored operands. The directive and contract stay last.
     const messages = [
         ...(profileBlock ? [{ role: 'system', content: profileBlock }] : []),
         { role: 'user', content: renderBlock('MANUSCRIPT', fitted.text) },
+        ...(selectionBlock ? [{ role: 'user', content: selectionBlock }] : []),
         { role: 'system', content: instructionBlock },
         { role: 'system', content: contractBlock },
     ];
 
     return {
+        action,
         messages,
         blocks,
-        inputTokens: framingTokens + profileTokens + fitted.tokens,
+        inputTokens: framingTokens + profileTokens + selectionTokens + fitted.tokens,
         framingTokens,
         profileTokens,
         profileText,
+        selectionTokens,
+        selectionText,
+        selectionWords: countWords(selectionText),
         reserveTokens: budget.reserveTokens,
         authorReserveTokens: budget.authorReserveTokens,
         reserveSource: budget.reserveSource,
@@ -619,6 +686,11 @@ export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
         sentWords: countWords(fitted.text),
         totalWords: countWords(text),
     };
+}
+
+/** Compatibility entry point used by the Continue-shaped Inspector and tests. */
+export function buildContinuePrompt(manuscript, options = {}) {
+    return buildPrompt('continue', { ...options, manuscript });
 }
 
 /**
@@ -638,7 +710,7 @@ export async function buildContinuePrompt(manuscript, { profile = null } = {}) {
  * ⚠️ Returns FRESH objects. createRawPrompt mutates the array it is handed
  * in place, so what is displayed must never be what is sent.
  *
- * @param {Array<{role: string, content: string}>} messages from buildContinuePrompt
+ * @param {Array<{role: string, content: string}>} messages from buildPrompt
  * @returns {Array<{role: string, label: string, content: string, expanded: boolean, failed: boolean}>}
  */
 export function expandForDisplay(messages) {
@@ -673,7 +745,7 @@ export function expandForDisplay(messages) {
     });
 }
 
-/** @param {object} prompt a buildContinuePrompt() result */
+/** @param {object} prompt a buildPrompt() result */
 export function needsPreflight(prompt) {
     return prompt.inputTokens > PREFLIGHT_TOKENS;
 }
@@ -687,7 +759,7 @@ export function needsPreflight(prompt) {
  * a generic failure with Retry rather than a crash.
  *
  * @param {unknown} error
- * @param {object|null} prompt the buildContinuePrompt() result that was sent, so
+ * @param {object|null} prompt the buildPrompt() result that was sent, so
  *   NO_MESSAGE can name the lever that is actually left
  */
 function classify(error, prompt = null) {
@@ -716,7 +788,7 @@ function classify(error, prompt = null) {
         // context allows, the context size is; if we raised it to the full
         // floor and the model still ran out, only their own setting above the
         // floor will do.
-        const lead = 'The model returned no prose — it used the entire reply budget thinking and '
+        const lead = 'The model returned no output — it used the entire reply budget thinking and '
             + 'ran out before writing. ';
         let advice = 'Raise the response length in your API settings: a reasoning model can spend '
             + 'a few thousand tokens before its first word, so it needs room for both. Around '
@@ -753,11 +825,11 @@ function classify(error, prompt = null) {
 }
 
 /**
- * Ask the model to continue. Single-flight.
+ * Run one writing action. Single-flight across every action and chapter.
  *
  * ⚠️ Single-flight is GLOBAL, not per chapter, and that is deliberate: one
  * model request at a time is the honest product model, and every extra one is
- * money. The cross-chapter consequence — B's Continue disabled behind A's
+ * money. The cross-chapter consequence — B's actions disabled behind A's
  * request — is surfaced by getActiveGeneration() rather than hidden behind a
  * button that looks stuck.
  *
@@ -766,14 +838,14 @@ function classify(error, prompt = null) {
  * identity, not a generation: close and reopen and the same id is open again.
  *
  * @param {{prompt: object, chapterId: string, chapterTitle: string, generation: number}} options
- * @returns {Promise<{text: string, chapterId: string, generation: number}|null>} null if a
- *   generation was already running
+ * @returns {Promise<{text: string, action: string, chapterId: string, generation: number}|null>}
  */
-export async function runContinue({ prompt, chapterId, chapterTitle, generation }) {
+export async function runAction({ prompt, chapterId, chapterTitle, generation }) {
     if (active) {
         return null;
     }
 
+    const action = prompt.action;
     const context = SillyTavern.getContext();
 
     const options = {
@@ -820,11 +892,11 @@ export async function runContinue({ prompt, chapterId, chapterTitle, generation 
 
     const promise = context.generateRaw(options);
 
-    active = { promise, chapterId, chapterTitle, generation };
+    active = { promise, action, chapterId, chapterTitle, generation };
 
     try {
         const text = await promise;
-        return { text, chapterId, generation };
+        return { text, action, chapterId, generation };
     } catch (error) {
         console.error(`[${EXTENSION_NAME}] generation failed`, error);
         throw classify(error, prompt);
@@ -834,4 +906,9 @@ export async function runContinue({ prompt, chapterId, chapterTitle, generation 
             active = null;
         }
     }
+}
+
+/** Compatibility entry point for the checkpoint-1 harness. */
+export function runContinue(options) {
+    return runAction(options);
 }

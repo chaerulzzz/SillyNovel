@@ -836,7 +836,7 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     background-color: var(--white30a);
 }
 
-/* --- Continue, preflight, suggestions (checkpoint 8) --------------------- */
+/* --- Writing actions, preflight and suggestions -------------------------- */
 
 .sillynovel-actions {
     flex: 0 0 auto;
@@ -846,13 +846,11 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     gap: 8px;
 }
 
-.sillynovel-continue,
+.sillynovel-action,
 .sillynovel-cancel,
 .sillynovel-preflight-confirm,
 .sillynovel-preflight-cancel,
-.sillynovel-insert,
-.sillynovel-copy,
-.sillynovel-discard,
+.sillynovel-suggestion-action,
 .sillynovel-inspector-refresh,
 .sillynovel-inspector-copy,
 .sillynovel-profile-save,
@@ -869,13 +867,11 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     cursor: pointer;
 }
 
-.sillynovel-continue:hover,
+.sillynovel-action:hover,
 .sillynovel-cancel:hover,
 .sillynovel-preflight-confirm:hover,
 .sillynovel-preflight-cancel:hover,
-.sillynovel-insert:hover,
-.sillynovel-copy:hover,
-.sillynovel-discard:hover,
+.sillynovel-suggestion-action:hover,
 .sillynovel-inspector-refresh:hover,
 .sillynovel-inspector-copy:hover,
 .sillynovel-profile-save:hover,
@@ -886,18 +882,16 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-profile-save:focus-visible,
 .sillynovel-profile-discard:focus-visible,
 .sillynovel-profile-reload:focus-visible,
-.sillynovel-continue:focus-visible,
+.sillynovel-action:focus-visible,
 .sillynovel-cancel:focus-visible,
 .sillynovel-preflight-confirm:focus-visible,
 .sillynovel-preflight-cancel:focus-visible,
-.sillynovel-insert:focus-visible,
-.sillynovel-copy:focus-visible,
-.sillynovel-discard:focus-visible {
+.sillynovel-suggestion-action:focus-visible {
     background-color: var(--white30a);
 }
 
-.sillynovel-continue:disabled,
-.sillynovel-insert:disabled,
+.sillynovel-action:disabled,
+.sillynovel-suggestion-action:disabled,
 .sillynovel-inspector-refresh:disabled,
 .sillynovel-inspector-copy:disabled,
 .sillynovel-profile-save:disabled,
@@ -940,7 +934,8 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     gap: 8px;
 }
 
-.sillynovel-suggestions-status[data-state="error"] {
+.sillynovel-suggestions-status[data-state="error"],
+.sillynovel-suggestions-status[data-state="warning"] {
     color: var(--SmartThemeQuoteColor, inherit);
 }
 
@@ -961,6 +956,69 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 8px;
     background-color: var(--black30a);
+}
+
+.sillynovel-suggestion-original-block,
+.sillynovel-suggestion-proposed-block {
+    margin-bottom: 10px;
+}
+
+.sillynovel-suggestion-original-block h6,
+.sillynovel-suggestion-proposed-block h6 {
+    margin: 0 0 4px;
+    font-size: calc(var(--mainFontSize) * 0.85);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+}
+
+.sillynovel-suggestion-original {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.6;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    opacity: 0.65;
+}
+
+.sillynovel-suggestion-history {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.sillynovel-history-previous,
+.sillynovel-history-next {
+    width: auto;
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 3px 8px;
+    color: inherit;
+    font-family: inherit;
+    font-size: calc(var(--mainFontSize) * 0.85);
+    cursor: pointer;
+}
+
+.sillynovel-history-previous:disabled,
+.sillynovel-history-next:disabled {
+    cursor: default;
+    opacity: 0.45;
+}
+
+.sillynovel-history-previous:not(:disabled):hover,
+.sillynovel-history-next:not(:disabled):hover,
+.sillynovel-history-previous:focus-visible,
+.sillynovel-history-next:focus-visible {
+    background-color: var(--white30a);
+}
+
+.sillynovel-history-position {
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
 }
 
 .sillynovel-suggestion-actions {

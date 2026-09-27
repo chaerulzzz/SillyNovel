@@ -1,5 +1,54 @@
 # Phase 3 tests
 
+## `validation-history.console.js` — output warnings and history
+
+A browser-console harness with **zero model cost**. Start with a freshly opened
+workspace and a saved chapter. It directly checks the validator patterns, then
+stubs `generateRaw` for three Continue results. It verifies that warnings leave
+the returned text and Insert control intact, Retry preserves earlier results,
+Previous restores each result's own warning, Discard reveals the prior result,
+and closing the panel clears history. The manuscript stays byte-identical with
+zero chapter and notes PUTs. The harness closes and reopens the workspace once.
+
+## `selection-actions.console.js` — Rewrite, Expand and anchored Replace
+
+A browser-console harness with **zero model cost**. Run it in a disposable test
+chapter with the SillyNovel panel open and the chapter saved. It stubs
+`generateRaw`, checks the Original/Proposed presentation, Replace, undo/redo,
+autosave, and byte-identical Discard. It also proves that an edit inside the
+selected range and a duplicate passage elsewhere cannot redirect replacement,
+that an edit before the selection is refused, and that deleting the selected
+passage so an identical copy slides into its offsets is refused too — the
+text at the offsets still matches, so only the edit's location tells them
+apart. Author edits are simulated as `beforeinput` then `execCommand`, the
+browser's own order; Chrome sends no `beforeinput` for `execCommand` itself.
+Every one of its 12 rows should read `PASS`.
+
+The harness saves one temporary replacement and then restores the original in a
+second PUT. Do not run it in two tabs at once.
+
+## `notes-actions.console.js` — Summarize and Brainstorm results
+
+A browser-console harness with **zero model cost**. Run it in a disposable test
+chapter with the SillyNovel panel open and both documents saved. It stubs
+`generateRaw`, checks that a notes result has Add to notes / Copy / Discard with
+no Insert element, verifies the manuscript stays byte-identical, and observes
+one notes PUT and zero chapter PUTs. It then writes the original notes back.
+
+The cleanup is a second notes PUT. Do not run the harness in two tabs at once;
+the compare-and-swap protection will correctly turn that race into a conflict.
+
+## `actions.console.js` — shared action machinery
+
+A browser-console harness with **zero model cost**. It builds Continue, Rewrite,
+Expand, Summarize and Brainstorm prompts against the real tokenizer, checks
+their block order and token arithmetic, proves selection handling and refusal,
+then stubs `generateRaw` to verify action identity and global single-flight.
+
+Reload an authenticated SillyTavern tab, keep the workspace panel closed, paste
+the whole file into devtools, and confirm every row reads `PASS`. The stub is
+restored in `finally`; no model request is made.
+
 ## `reserve-floor.console.js` — the `responseLength` conditional floor
 
 A browser-console harness, **zero model cost**. It proves every branch of

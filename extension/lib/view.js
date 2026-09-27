@@ -35,16 +35,19 @@ import {
     saveProfile,
 } from './session.js';
 import {
+    ACTIONS,
     GenerateErrorKind,
     PROMPT_BLOCKS,
+    buildPrompt,
     buildContinuePrompt,
     renderProfileText,
     cancelGeneration,
     expandForDisplay,
     getActiveGeneration,
     needsPreflight,
-    runContinue,
+    runAction as runGenerationAction,
 } from './generate.js';
+import { validate } from './validate.js';
 
 const EXTENSION_NAME = 'sillynovel-writing';
 
@@ -187,7 +190,7 @@ function renderRecoveryOffer(panel) {
     const editor = editorOf(panel);
 
     if (editor) {
-        editor.value = offer.draft;
+        setEditorText(editor, getWorkspace()?.chapter.id ?? null, offer.draft);
     }
 
     const message = panel.querySelector('.sillynovel-recovery-message');
@@ -245,7 +248,7 @@ async function discardRecoveredDraft(panel) {
     const editor = editorOf(panel);
 
     if (editor && workspace) {
-        editor.value = workspace.content;
+        setEditorText(editor, workspace.chapter.id, workspace.content);
     }
 
     renderRecoveryOffer(panel);
@@ -801,7 +804,7 @@ function renderWorkspaceContent(panel, workspace) {
 
     const editor = panel.querySelector('.sillynovel-editor');
     if (editor) {
-        editor.value = workspace.content;
+        setEditorText(editor, workspace.chapter.id, workspace.content);
     }
 
     // Notes are chapter-scoped, so unlike the profile they ARE repainted here.
@@ -870,29 +873,153 @@ function handleEditorChange(panel) {
     // is exactly when saving should resume.
     clearOversizeHalt();
 
-    // A continuation is a continuation OF something. Once that something moves,
-    // say so rather than silently offering prose that no longer follows on.
+    // Once the source moves, say so rather than presenting the old result as current.
     renderSuggestionStale(panel);
 
     // Same reasoning, and the same string comparison: a displayed prompt that
-    // no longer matches the editor is no longer the prompt Continue would send.
+    // no longer matches the editor is no longer the prompt the action would send.
     renderInspectorStale(panel);
 
     chapterSaver.handleChange(panel);
 }
 
-/* --- Continue and the suggestion pane (checkpoint 8) --------------------- */
+/* --- writing actions and the suggestion pane ----------------------------- */
 
 /**
  * The suggestion currently on offer, or null. VIEW state: it is what the pane
  * is painting, not what the model is doing.
  *
- * `source` is the editor text the continuation was generated from, which is the
- * only way to tell later that the chapter has moved underneath it.
- *
- * @type {{text: string, chapterId: string, generation: number, source: string}|null}
+ * @type {{text: string, action: string, resultKind: string, chapterId: string,
+ *   generation: number, source: string,
+ *   selection: SelectionAnchor|null,
+ *   warnings: string[]}|null}
  */
 let suggestion = null;
+
+const SUGGESTION_HISTORY_LIMIT = 10;
+const suggestionHistory = new Map();
+
+/** @param {string} chapterId @param {boolean} [create] */
+function suggestionHistoryFor(chapterId, create = false) {
+    let state = suggestionHistory.get(chapterId);
+
+    if (!state && create) {
+        state = { items: [], index: null };
+        suggestionHistory.set(chapterId, state);
+    }
+
+    return state ?? null;
+}
+
+/* --- selection anchors ---------------------------------------------------- */
+
+/**
+ * @typedef {{start: number, end: number, text: string, chapterId: string, broken: boolean}} SelectionAnchor
+ */
+
+/**
+ * Every selection a Rewrite or Expand was asked about, from the click until its
+ * result leaves history. The same object is the target's `selection` and the
+ * suggestion's, so breaking it here is seen everywhere at once.
+ *
+ * ⚠️ Comparing text at the stored offsets is NOT enough. With the passage
+ * `S … S`, deleting the first S and the middle leaves the same editor text as
+ * deleting the middle and the second S — only where the edit happened tells
+ * the two apart. So every edit is located as it happens, and any edit that
+ * starts before an anchor's end breaks it for good.
+ *
+ * Anchors from a failed or cancelled run stay until the panel closes: the
+ * error's Retry reuses them, so they must keep tracking edits.
+ *
+ * @type {Set<SelectionAnchor>}
+ */
+const selectionAnchors = new Set();
+
+/** Where the edit about to land starts, recorded before it lands; null once applied. */
+let pendingEditStart = null;
+
+/** The chapter whose text the editor holds, and each chapter's text when last shown. */
+let editorChapterId = null;
+const lastSeenText = new Map();
+
+/**
+ * Where an edit starts, read in `beforeinput` while the selection still
+ * describes the range about to change. Anything that cannot be located says 0,
+ * which breaks every anchor: a false refusal is recoverable, a wrong
+ * replacement is not.
+ *
+ * @param {InputEvent} event
+ * @param {HTMLTextAreaElement} editor
+ */
+function editStartFor(event, editor) {
+    const { selectionStart: start, selectionEnd: end } = editor;
+    const type = event.inputType ?? '';
+
+    // Undo, redo and drag-and-drop change a range the selection does not describe.
+    if (type.startsWith('history') || type === 'insertFromDrop' || type === 'deleteByDrag') {
+        return 0;
+    }
+
+    if (start !== end || !type.startsWith('delete')) {
+        return start;
+    }
+
+    // A collapsed backward delete removes text BEFORE the caret. One step back
+    // is at most one grapheme; two code units covers a surrogate pair.
+    if (type === 'deleteContentBackward') {
+        return Math.max(0, start - 2);
+    }
+
+    // A word or line backwards can reach anywhere; forward deletes start at the caret.
+    return type.endsWith('Backward') ? 0 : start;
+}
+
+/** @param {string|null} chapterId @param {number} editStart */
+function breakAnchors(chapterId, editStart) {
+    for (const anchor of selectionAnchors) {
+        if (anchor.chapterId === chapterId && editStart < anchor.end) {
+            anchor.broken = true;
+        }
+    }
+}
+
+/** Apply the recorded edit, if the input handler has not already done so. */
+function applyPendingEdit() {
+    if (pendingEditStart !== null) {
+        breakAnchors(editorChapterId, pendingEditStart);
+        pendingEditStart = null;
+    }
+}
+
+/**
+ * Replace the editor's whole text — a chapter open, a recovery draft, a
+ * declined draft. Text that differs from what this chapter last showed moved
+ * underneath every anchor in it.
+ *
+ * @param {HTMLTextAreaElement} editor
+ * @param {string} chapterId
+ * @param {string} text
+ */
+function setEditorText(editor, chapterId, text) {
+    if (editorChapterId !== null) {
+        lastSeenText.set(editorChapterId, editor.value);
+    }
+
+    const previous = lastSeenText.get(chapterId);
+
+    if (previous !== undefined && previous !== text) {
+        breakAnchors(chapterId, 0);
+    }
+
+    editor.value = text;
+    editorChapterId = chapterId;
+    pendingEditStart = null;
+}
+
+/** @param {SelectionAnchor} anchor @param {HTMLTextAreaElement} editor */
+function anchorHolds(anchor, editor) {
+    return !anchor.broken && editor.value.slice(anchor.start, anchor.end) === anchor.text;
+}
 
 /** The preflight awaiting a decision, or null. */
 let pendingPreflight = null;
@@ -902,8 +1029,8 @@ let pendingPreflight = null;
  *
  * VIEW state, and a SNAPSHOT.
  *
- * ⚠️ Never the object buildContinuePrompt() returned and never an array
- * runContinue() sends. createRawPrompt mutates the array it is handed, in place
+ * ⚠️ Never the object buildPrompt() returned and never an array
+ * runAction() sends. createRawPrompt mutates the array it is handed, in place
  * (script.js:3886), so the array displayed must never be the array sent.
  *
  * ⚠️ `source` is the manuscript string the prompt was BUILT FROM, threaded
@@ -912,7 +1039,7 @@ let pendingPreflight = null;
  * during the tokenizer round trip — the region quietly claiming to show
  * something it is not.
  *
- * @type {{origin: 'built'|'sent', source: string, chapterId: string,
+ * @type {{origin: 'built'|'sent', action: string, source: string, chapterId: string,
  *   generation: number, messages: Array<object>, excluded: Array<object>,
  *   figures: object|null, refusal: {message: string, kind: string}|null}|null}
  */
@@ -921,13 +1048,13 @@ let inspection = null;
 /**
  * True while a prompt is being measured for the Inspector.
  *
- * Mirrors `building`, but it never gates Continue: inspecting costs no model
+ * Mirrors `building`, but it never gates writing actions: inspecting costs no model
  * request, so it must not disable the primary action.
  */
 let inspecting = false;
 
 /**
- * True from the moment Continue is accepted until the attempt ends.
+ * True from the moment an action is accepted until prompt measurement ends.
  *
  * ⚠️ Wider than generate.js's single-flight on purpose. That guard starts at
  * the model call, but getTokenCountAsync round-trips to the server, so there is
@@ -956,24 +1083,24 @@ function setActionNote(panel, state, text) {
 }
 
 /**
- * Paint Continue / Cancel from the LIVE generation, not from a local flag.
+ * Paint the action bar from the LIVE generation, not from a local flag.
  *
  * ⚠️ generate.js's in-flight state deliberately outlives the panel, so this is
  * the function that keeps a reopened panel honest: a request started before the
  * close is still running and still costing money, so the bar shows it — with
- * Cancel — rather than showing a Continue button that would buy a second one.
+ * Cancel — rather than showing an action button that would buy a second one.
  *
  * @param {HTMLElement} panel
  */
 function renderActionBar(panel) {
-    const continueButton = panel.querySelector('.sillynovel-continue');
+    const actionButtons = panel.querySelectorAll('.sillynovel-action');
     const cancelButton = panel.querySelector('.sillynovel-cancel');
     const workspace = getWorkspace();
     const running = getActiveGeneration();
 
-    if (continueButton) {
-        continueButton.hidden = running !== null;
-        continueButton.disabled = pendingPreflight !== null || building;
+    for (const button of actionButtons) {
+        button.hidden = running !== null;
+        button.disabled = pendingPreflight !== null || building;
     }
 
     if (cancelButton) {
@@ -984,15 +1111,14 @@ function renderActionBar(panel) {
         return;
     }
 
-    // Name the chapter when it is not the one on screen. The title comes from
-    // the capture rather than the nav: the workspace may have moved on, or been
-    // closed and reopened somewhere else entirely.
     const elsewhere = !workspace || workspace.chapter.id !== running.chapterId;
+    const progress = ACTIONS[running.action]?.progress ?? 'Generating…';
+    const progressElsewhere = `${progress.replace(/…$/, '')} in ${running.chapterTitle}…`;
 
     setActionNote(
         panel,
         'busy',
-        elsewhere ? `Generating in ${running.chapterTitle}…` : 'Generating…',
+        elsewhere ? progressElsewhere : progress,
     );
 }
 
@@ -1005,8 +1131,18 @@ function renderSuggestionStale(panel) {
     }
 
     const editor = editorOf(panel);
+    let isStale = false;
 
-    stale.hidden = !suggestion || !editor || editor.value === suggestion.source;
+    if (suggestion && suggestion.resultKind !== 'notes' && editor) {
+        isStale = suggestion.selection
+            ? !anchorHolds(suggestion.selection, editor)
+            : editor.value !== suggestion.source;
+    }
+
+    stale.textContent = suggestion?.selection
+        ? 'The selected passage changed or moved, so this replacement is no longer anchored.'
+        : 'The chapter changed after this was generated, so it may no longer follow on.';
+    stale.hidden = !isStale;
 }
 
 /**
@@ -1046,11 +1182,57 @@ function setSuggestionStatus(panel, state, text, retry) {
 }
 
 /** @param {HTMLElement} panel */
+function renderSuggestionHistory(panel) {
+    const controls = panel.querySelector('.sillynovel-suggestion-history');
+    const previous = panel.querySelector('.sillynovel-history-previous');
+    const next = panel.querySelector('.sillynovel-history-next');
+    const position = panel.querySelector('.sillynovel-history-position');
+    const state = suggestion ? suggestionHistoryFor(suggestion.chapterId) : null;
+    const index = state?.items.indexOf(suggestion) ?? -1;
+    const visible = index >= 0 && state.items.length > 1;
+
+    if (controls) {
+        controls.hidden = !visible;
+    }
+
+    if (previous) {
+        previous.disabled = !visible || index === 0;
+    }
+
+    if (next) {
+        next.disabled = !visible || index === state.items.length - 1;
+    }
+
+    if (position) {
+        position.textContent = visible ? `${index + 1} / ${state.items.length}` : '';
+    }
+}
+
+/** @param {string} act @param {string} label @param {{disabled?: boolean, title?: string}} [options] */
+function suggestionActionButton(act, label, { disabled = false, title = '' } = {}) {
+    const button = document.createElement('button');
+
+    button.type = 'button';
+    button.className = `sillynovel-suggestion-action sillynovel-${act}`;
+    button.dataset.act = act;
+    button.textContent = label;
+    button.disabled = disabled;
+    button.title = title;
+
+    return button;
+}
+
+/** @param {HTMLElement} panel */
 function renderSuggestion(panel) {
     const block = panel.querySelector('.sillynovel-suggestion');
     const empty = panel.querySelector('.sillynovel-suggestions-empty');
     const body = panel.querySelector('.sillynovel-suggestion-text');
+    const originalBlock = panel.querySelector('.sillynovel-suggestion-original-block');
+    const original = panel.querySelector('.sillynovel-suggestion-original');
+    const proposedLabel = panel.querySelector('.sillynovel-suggestion-proposed-label');
+    const actions = panel.querySelector('.sillynovel-suggestion-actions');
     const status = panel.querySelector('.sillynovel-suggestions-status');
+    const hasSelection = Boolean(suggestion?.selection && suggestion.resultKind === 'prose');
 
     if (block) {
         block.hidden = suggestion === null;
@@ -1067,28 +1249,143 @@ function renderSuggestion(panel) {
         body.textContent = suggestion?.text ?? '';
     }
 
+    if (originalBlock) {
+        originalBlock.hidden = !hasSelection;
+    }
+
+    if (original) {
+        original.textContent = hasSelection ? suggestion.selection.text : '';
+    }
+
+    if (proposedLabel) {
+        proposedLabel.hidden = !hasSelection;
+    }
+
+    if (actions) {
+        if (!suggestion) {
+            actions.replaceChildren();
+        } else {
+            let primary;
+
+            if (suggestion.resultKind === 'notes') {
+                primary = suggestionActionButton('add-to-notes', 'Add to notes');
+            } else if (suggestion.selection) {
+                primary = suggestionActionButton('replace', 'Replace');
+            } else {
+                primary = suggestionActionButton('insert', 'Insert');
+            }
+
+            actions.replaceChildren(
+                primary,
+                suggestionActionButton('copy', 'Copy'),
+                suggestionActionButton('discard', 'Discard'),
+            );
+        }
+    }
+
+    renderSuggestionHistory(panel);
     renderSuggestionStale(panel);
 }
 
-/**
- * Drop whatever the pane is showing. Called on every chapter install.
- *
- * ⚠️ A suggestion belongs to the chapter it was generated from. Leaving it up
- * across a switch would put chapter A's continuation on screen above chapter B,
- * with an Insert button that writes A's prose into B.
- *
- * ⚠️ This clears VIEW state only. It must never reach into generate.js: the
- * request is still running and still cancellable, and forgetting it is what
- * would let a second one be bought.
- *
- * @param {HTMLElement} panel
- */
-function clearSuggestion(panel) {
-    suggestion = null;
-    pendingPreflight = null;
+/** @param {HTMLElement} panel @param {object|null} next */
+function showSuggestion(panel, next) {
+    suggestion = next;
     setSuggestionStatus(panel, null);
-    hidePreflight(panel);
     renderSuggestion(panel);
+
+    if (next?.warnings?.length) {
+        const retryTarget = next;
+        setSuggestionStatus(
+            panel,
+            'warning',
+            `${next.warnings.join(' ')} Review before using, or retry.`,
+            () => { void startAction(panel, retryTarget.action, retryTarget.selection); },
+        );
+    }
+}
+
+/** @param {HTMLElement} panel @param {object} next */
+function appendSuggestion(panel, next) {
+    const state = suggestionHistoryFor(next.chapterId, true);
+
+    state.items.push(next);
+
+    if (state.items.length > SUGGESTION_HISTORY_LIMIT) {
+        const evicted = state.items.shift();
+
+        if (evicted?.selection) {
+            selectionAnchors.delete(evicted.selection);
+        }
+    }
+
+    state.index = state.items.length - 1;
+    showSuggestion(panel, next);
+}
+
+/** @param {HTMLElement} panel @param {number} offset */
+function moveSuggestionHistory(panel, offset) {
+    if (!suggestion) {
+        return;
+    }
+
+    const state = suggestionHistoryFor(suggestion.chapterId);
+    const index = state?.items.indexOf(suggestion) ?? -1;
+    const nextIndex = index + offset;
+
+    if (!state || nextIndex < 0 || nextIndex >= state.items.length) {
+        return;
+    }
+
+    state.index = nextIndex;
+    showSuggestion(panel, state.items[nextIndex]);
+}
+
+/** @param {HTMLElement} panel @param {boolean} revealPrevious */
+function removeCurrentSuggestion(panel, revealPrevious) {
+    if (!suggestion) {
+        return;
+    }
+
+    const state = suggestionHistoryFor(suggestion.chapterId);
+    const index = state?.items.indexOf(suggestion) ?? -1;
+
+    if (!state || index < 0) {
+        showSuggestion(panel, null);
+        return;
+    }
+
+    state.items.splice(index, 1);
+
+    if (suggestion.selection) {
+        selectionAnchors.delete(suggestion.selection);
+    }
+
+    if (state.items.length === 0) {
+        suggestionHistory.delete(suggestion.chapterId);
+        showSuggestion(panel, null);
+        return;
+    }
+
+    if (!revealPrevious) {
+        state.index = null;
+        showSuggestion(panel, null);
+        return;
+    }
+
+    state.index = index > 0 ? index - 1 : 0;
+    showSuggestion(panel, state.items[state.index]);
+}
+
+/** Restore only the current chapter's in-memory suggestion. @param {HTMLElement} panel */
+function clearSuggestion(panel) {
+    pendingPreflight = null;
+    hidePreflight(panel);
+
+    const chapterId = getWorkspace()?.chapter.id;
+    const state = chapterId ? suggestionHistoryFor(chapterId) : null;
+    const next = state && state.index !== null ? state.items[state.index] ?? null : null;
+
+    showSuggestion(panel, next);
 }
 
 /** @param {HTMLElement} panel */
@@ -1102,7 +1399,7 @@ function hidePreflight(panel) {
 
 /**
  * @param {HTMLElement} panel
- * @param {object|null} prompt a buildContinuePrompt() result, or null to clear
+ * @param {object|null} prompt a buildPrompt() result, or null to clear
  */
 function renderTrimNote(panel, prompt) {
     const note = panel.querySelector('.sillynovel-trim-note');
@@ -1146,8 +1443,6 @@ function showPreflight(panel, prompt, target) {
         return;
     }
 
-    // `building` is released when startContinue returns; the preflight keeps the
-    // button disabled on its own until the author answers.
     pendingPreflight = { prompt, target };
 
     const scope = prompt.trimmed
@@ -1156,12 +1451,20 @@ function showPreflight(panel, prompt, target) {
 
     message.textContent = [
         'This is a large request.',
+        `Action: ${ACTIONS[prompt.action]?.label ?? prompt.action}.`,
         `Scope: ${scope}.`,
+        ...(prompt.selectionWords > 0
+            ? [`Selected passage: ~${prompt.selectionWords} words.`]
+            : []),
         `About ${prompt.inputTokens} input tokens, plus up to ${prompt.reserveTokens} for the reply`
             + (prompt.reserveSource === 'raised-by-sillynovel'
                 ? ` (raised by SillyNovel from your ${prompt.authorReserveTokens}).`
                 : '.'),
         ...(prompt.profileTokens > 0 ? [`Of those input tokens, the Writing Profile is ${prompt.profileTokens}.`] : []),
+        ...(prompt.selectionTokens > 0 ? [`The selected passage is ${prompt.selectionTokens} tokens.`] : []),
+        ...(ACTIONS[prompt.action]?.resultKind === 'notes'
+            ? ['The result will be notes, not manuscript prose.']
+            : []),
         'Requests: 1.',
         'The price is not known — SillyNovel cannot see your provider’s rates.',
     ].join('\n');
@@ -1176,7 +1479,9 @@ function showPreflight(panel, prompt, target) {
  *
  * @param {HTMLElement} panel
  * @param {object} prompt
- * @param {{chapterId: string, chapterTitle: string, generation: number}} target
+ * @param {{action: string, chapterId: string, chapterTitle: string, generation: number,
+ *   source: string, profileSource: string,
+ *   selection: {start: number, end: number, text: string}|null}} target
  */
 async function runGeneration(panel, prompt, target) {
     // ⚠️ The previous suggestion is superseded the moment a new one is asked
@@ -1188,20 +1493,19 @@ async function runGeneration(panel, prompt, target) {
     setSuggestionStatus(panel, null);
     renderSuggestion(panel);
 
-    // The prompt startContinue captured is now the one going out.
     markInspectionSent(target);
     renderInspection(panel);
 
-    // ⚠️ Started BEFORE the bar is painted, and awaited after. runContinue
+    // ⚠️ Started BEFORE the bar is painted, and awaited after. runAction
     // registers the generation synchronously, before its own first await, so
     // calling it first is what lets renderActionBar see one. Painting first and
     // calling second — the natural order to write — leaves the bar showing
-    // "Measuring the prompt…" with Continue disabled and CANCEL HIDDEN for the
+    // "Measuring the prompt…" with actions disabled and CANCEL HIDDEN for the
     // whole request, in the one chapter the author is most likely watching: the
-    // one they pressed Continue in. Nothing else repaints until the generation
+    // one they invoked the action in. Nothing else repaints until generation
     // ends, so the cancellable "Generating…" state PLAN.md:447 asks for would
     // exist only for authors who happened to navigate away.
-    const pending = runContinue({ prompt, ...target });
+    const pending = runGenerationAction({ prompt, ...target });
 
     renderActionBar(panel);
 
@@ -1214,7 +1518,9 @@ async function runGeneration(panel, prompt, target) {
         // the author has already left is noise, and the same reasoning
         // session.js applies to stale saves.
         if (panel.isConnected && isCurrentTarget(target.generation, target.chapterId)) {
-            renderGenerationError(panel, error, () => { void startContinue(panel); });
+            renderGenerationError(panel, error, () => {
+                void startAction(panel, target.action, target.selection);
+            });
         }
 
         return;
@@ -1245,14 +1551,19 @@ async function runGeneration(panel, prompt, target) {
         return;
     }
 
-    suggestion = {
+    const check = validate(result.text, result.action);
+    const nextSuggestion = {
         text: result.text,
+        action: result.action,
+        resultKind: ACTIONS[result.action]?.resultKind ?? 'prose',
         chapterId: result.chapterId,
         generation: result.generation,
-        source: editorOf(panel)?.value ?? '',
+        source: target.source,
+        selection: target.selection,
+        warnings: check.warnings,
     };
 
-    renderSuggestion(panel);
+    appendSuggestion(panel, nextSuggestion);
 }
 
 /**
@@ -1275,11 +1586,17 @@ function renderGenerationError(panel, error, retry) {
 }
 
 /**
- * Continue: assemble, price, then ask.
- *
  * @param {HTMLElement} panel
+ * @param {string} action
+ * @param {{start: number, end: number, text: string}|null} [presetSelection]
  */
-async function startContinue(panel) {
+async function startAction(panel, action, presetSelection = null) {
+    const config = ACTIONS[action];
+
+    if (!config) {
+        return;
+    }
+
     // ⚠️ A pending recovery offer blocks this, reusing checkpoint 7's halt
     // predicate. The editor holds the draft while the server holds something
     // else, so generating from one of two unreconciled versions and then
@@ -1304,20 +1621,44 @@ async function startContinue(panel) {
         return;
     }
 
+    const editor = editorOf(panel);
+    const source = editor?.value ?? '';
+    const profile = readProfileForm(panel);
+    const profileSource = renderProfileText(profile);
+    let selection = null;
+
+    if (config.needsSelection) {
+        const start = presetSelection?.start ?? editor?.selectionStart ?? 0;
+        const end = presetSelection?.end ?? editor?.selectionEnd ?? 0;
+        const text = presetSelection?.text ?? source.slice(start, end);
+
+        // A retry inherits the earlier anchor, so an edit that broke it breaks the retry too.
+        if (presetSelection && (!editor || !anchorHolds(presetSelection, editor))) {
+            setActionNote(panel, 'error', 'The selected passage changed. Select it again and rerun the action.');
+            return;
+        }
+
+        if (text.trim() === '') {
+            setActionNote(panel, 'error', `Select a passage to ${action} first.`);
+            return;
+        }
+
+        selection = { start, end, text, chapterId: workspace.chapter.id, broken: false };
+        selectionAnchors.add(selection);
+    }
+
     const target = {
+        action,
         chapterId: workspace.chapter.id,
         chapterTitle: workspace.chapter.title,
-        // Captured at the CLICK, like every other long action in this codebase.
         generation: getWorkspaceGeneration(),
+        source,
+        profileSource,
+        selection,
     };
 
     setSuggestionStatus(panel, null);
     setActionNote(panel, 'busy', 'Measuring the prompt…');
-
-    // ⚠️ Read ONCE and threaded through, so the string the prompt is built
-    // from is the same string the Inspector later compares against for
-    // staleness. Reading the editor again after the await would let them differ.
-    const source = editorOf(panel)?.value ?? '';
 
     building = true;
     renderActionBar(panel);
@@ -1327,10 +1668,11 @@ async function startContinue(panel) {
         let prompt;
 
         try {
-            // The EDITOR, not the saved copy: with a 2 s debounce the paragraph
-            // the author just typed is usually still unsaved, and continuing
-            // from the server's version would silently ignore it.
-            prompt = await buildContinuePrompt(source, { profile: readProfileForm(panel) });
+            prompt = await buildPrompt(action, {
+                manuscript: source,
+                selection: selection?.text ?? '',
+                profile,
+            });
         } catch (error) {
             if (panel.isConnected) {
                 setActionNote(panel, 'error', error?.message ?? 'That did not work.');
@@ -1346,14 +1688,15 @@ async function startContinue(panel) {
             return;
         }
 
-        // Token counting is async and can round-trip to the server, so the
-        // workspace may have moved while it ran.
         if (!panel.isConnected || !isCurrentTarget(target.generation, target.chapterId)) {
             return;
         }
 
-        // Free: startContinue already built this prompt, so the Inspector costs
-        // no additional token counts on this path.
+        if (!actionSnapshotIsCurrent(panel, target)) {
+            setActionNote(panel, 'error', 'The chapter or Writing Profile changed while the prompt was measured. Run the action again.');
+            return;
+        }
+
         captureInspection(prompt, target, source, 'built');
         renderInspection(panel);
 
@@ -1380,6 +1723,16 @@ async function startContinue(panel) {
     }
 }
 
+/** @param {HTMLElement} panel @param {object} target */
+function actionSnapshotIsCurrent(panel, target) {
+    const editor = editorOf(panel);
+
+    return Boolean(editor)
+        && isCurrentTarget(target.generation, target.chapterId)
+        && editor.value === target.source
+        && renderProfileText(readProfileForm(panel)) === target.profileSource;
+}
+
 /**
  * Take the suggestion into the manuscript.
  *
@@ -1388,7 +1741,7 @@ async function startContinue(panel) {
 function insertSuggestion(panel) {
     const editor = editorOf(panel);
 
-    if (!suggestion || !editor) {
+    if (!suggestion || suggestion.resultKind !== 'prose' || suggestion.selection || !editor) {
         return;
     }
 
@@ -1408,6 +1761,7 @@ function insertSuggestion(panel) {
     // to keep writing.
     editor.focus();
     editor.setSelectionRange(existing.length, existing.length);
+    pendingEditStart = existing.length;
 
     let inserted = false;
 
@@ -1434,9 +1788,10 @@ function insertSuggestion(panel) {
     // The status line goes with it: a "Copied." left over from before the insert
     // describes a suggestion that is now manuscript, and it also suppresses the
     // pane's own empty hint, so the pane ends up saying nothing true at all.
-    suggestion = null;
-    setSuggestionStatus(panel, null);
-    renderSuggestion(panel);
+    removeCurrentSuggestion(panel, false);
+
+    // The fallback assignment fires no input event, so nothing applied the edit yet.
+    applyPendingEdit();
 
     // ⚠️ Called on BOTH paths, including the one where execCommand fired
     // `input` natively. A `true` return says the edit was applied, not that an
@@ -1444,6 +1799,111 @@ function insertSuggestion(panel) {
     // should not rest on that distinction holding in every browser. The call is
     // idempotent, so the redundant one costs nothing.
     handleEditorChange(panel);
+}
+
+/** @param {HTMLElement} panel */
+function replaceSelection(panel) {
+    const editor = editorOf(panel);
+
+    if (!suggestion || suggestion.resultKind !== 'prose' || !suggestion.selection || !editor) {
+        return;
+    }
+
+    const { start, end } = suggestion.selection;
+
+    // ⚠️ The anchor, not the text at its offsets: an identical passage can slide
+    // into those offsets after the selected one is deleted.
+    if (!anchorHolds(suggestion.selection, editor)) {
+        setSuggestionStatus(
+            panel,
+            'error',
+            'The passage you selected has changed or moved, so it cannot be replaced safely. Select it again and retry, or copy the rewrite.',
+        );
+        renderSuggestion(panel);
+        return;
+    }
+
+    const existing = editor.value;
+    const replacement = suggestion.text;
+
+    editor.focus();
+    editor.setSelectionRange(start, end);
+    // Other results in this chapter's history may be anchored after this one.
+    pendingEditStart = start;
+
+    let inserted = false;
+
+    try {
+        inserted = document.execCommand('insertText', false, replacement);
+    } catch {
+        inserted = false;
+    }
+
+    if (!inserted) {
+        editor.value = existing.slice(0, start) + replacement + existing.slice(end);
+        const caret = start + replacement.length;
+        editor.setSelectionRange(caret, caret);
+    }
+
+    removeCurrentSuggestion(panel, false);
+    applyPendingEdit();
+    handleEditorChange(panel);
+}
+
+/** @param {HTMLElement} panel */
+function expandNotes(panel) {
+    const toggle = panel.querySelector('.sillynovel-notes-toggle');
+    const body = panel.querySelector('.sillynovel-notes-body');
+
+    if (toggle && body) {
+        toggle.setAttribute('aria-expanded', 'true');
+        body.hidden = false;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function addSuggestionToNotes(panel) {
+    const notes = notesEditorOf(panel);
+
+    if (!suggestion || suggestion.resultKind !== 'notes' || !notes) {
+        return;
+    }
+
+    expandNotes(panel);
+
+    if (getNotesHalt() !== null) {
+        notesSaver.renderHalt(panel);
+        setSuggestionStatus(panel, 'error', 'Resolve the notes save problem before adding more.');
+        return;
+    }
+
+    const existing = notes.value;
+    const payload = (existing.trim() ? '\n\n' : '') + suggestion.text;
+
+    notes.focus();
+    notes.setSelectionRange(existing.length, existing.length);
+
+    let inserted = false;
+
+    try {
+        inserted = document.execCommand('insertText', false, payload);
+    } catch {
+        inserted = false;
+    }
+
+    if (!inserted) {
+        notes.value = existing + payload;
+        notes.setSelectionRange(notes.value.length, notes.value.length);
+    }
+
+    removeCurrentSuggestion(panel, false);
+    handleNotesChange(panel);
+}
+
+/** @param {HTMLElement} panel */
+function discardSuggestion(panel) {
+    // Rejection changes only the pane; neither manuscript nor notes is touched.
+    removeCurrentSuggestion(panel, true);
 }
 
 /**
@@ -1512,9 +1972,10 @@ async function copySuggestion(panel) {
         return;
     }
 
-    const copied = await copyToClipboard(suggestion.text);
+    const target = suggestion;
+    const copied = await copyToClipboard(target.text);
 
-    if (!panel.isConnected) {
+    if (!panel.isConnected || suggestion !== target) {
         return;
     }
 
@@ -1559,8 +2020,8 @@ const INSPECTOR_NOTE = 'This is the prompt SillyNovel assembles, with macros exp
  * can be visibly longer than the number beside it claims.
  */
 const COUNT_CAVEAT = 'Framing is the instruction, the contract and the [MANUSCRIPT] header line '
-    + 'counted as one joined string, so those have no per-block figures; the Writing Profile and '
-    + 'the manuscript are counted on their own and shown beside their blocks. All counts are '
+    + 'counted as one joined string, so those have no per-block figures; the Writing Profile, '
+    + 'selection and manuscript are counted on their own and shown beside their blocks. All counts are '
     + 'taken before macros expand — SillyTavern expands them after we count, and the safety '
     + 'margin is what covers the difference, along with the chat envelope no per-block count sees.';
 
@@ -1642,16 +2103,18 @@ function blockFor(prompt, label) {
  * provider credentials, and an allowlist of numbers cannot become a key dump.
  * The guard is a grep over this file finding no such reads at all.
  *
- * @param {object} prompt a buildContinuePrompt() result
+ * @param {object} prompt a buildPrompt() result
  */
 function figuresFromPrompt(prompt) {
     return {
+        action: prompt.action,
         contextTokens: prompt.contextTokens,
         reserveTokens: prompt.reserveTokens,
         authorReserveTokens: prompt.authorReserveTokens ?? null,
         reserveSource: prompt.reserveSource,
         framingTokens: prompt.framingTokens,
         profileTokens: prompt.profileTokens ?? null,
+        selectionTokens: prompt.selectionTokens ?? null,
         marginTokens: prompt.marginTokens,
         allowanceTokens: prompt.allowanceTokens,
         manuscriptTokens: blockFor(prompt, 'MANUSCRIPT')?.tokens ?? null,
@@ -1673,12 +2136,14 @@ function figuresFromPrompt(prompt) {
  */
 function figuresFromBudget(budget) {
     return {
+        action: budget.action ?? null,
         contextTokens: budget.contextTokens,
         reserveTokens: budget.reserveTokens,
         authorReserveTokens: budget.authorReserveTokens ?? null,
         reserveSource: budget.reserveSource,
         framingTokens: budget.framingTokens,
         profileTokens: budget.profileTokens ?? null,
+        selectionTokens: budget.selectionTokens ?? null,
         marginTokens: budget.marginTokens,
         allowanceTokens: budget.allowanceTokens,
         manuscriptTokens: null,
@@ -1699,7 +2164,7 @@ function figuresFromBudget(budget) {
  * applied. Reading blocks[].content instead is the easiest mistake to make in
  * this file and would show a prompt the model never received.
  *
- * @param {object} prompt a buildContinuePrompt() result
+ * @param {object} prompt a buildPrompt() result
  * @param {{chapterId: string, generation: number}} target
  * @param {string} source the manuscript the prompt was built from
  * @param {'built'|'sent'} origin
@@ -1707,6 +2172,7 @@ function figuresFromBudget(budget) {
 function captureInspection(prompt, target, source, origin) {
     inspection = {
         origin,
+        action: prompt.action,
         source,
         // What the profile rendered to at capture time — a string, compared
         // as a string, so staleness never re-counts anything.
@@ -1724,9 +2190,6 @@ function captureInspection(prompt, target, source, origin) {
                 failed: message.failed,
                 text: message.content,
                 reason: block?.reason ?? '',
-                // MANUSCRIPT is the only block carrying its own count. A blank
-                // would read as "unknown" and a zero as "free", so the other two
-                // say where their tokens actually went.
                 tokenLabel: typeof block?.tokens === 'number'
                     ? `${block.tokens.toLocaleString()} tokens`
                     : 'counted with the framing',
@@ -1772,6 +2235,7 @@ function refusalInspection(panel, error, target, source) {
 
     inspection = {
         origin: 'built',
+        action: budget?.action ?? target.action ?? 'continue',
         source,
         profileSource: null,
         chapterId: target.chapterId,
@@ -1808,6 +2272,7 @@ function refusalInspection(panel, error, target, source) {
  */
 function markInspectionSent(target) {
     if (inspection
+        && inspection.action === target.action
         && inspection.chapterId === target.chapterId
         && inspection.generation === target.generation) {
         inspection.origin = 'sent';
@@ -1831,6 +2296,7 @@ async function buildInspection(panel) {
     }
 
     const target = {
+        action: 'continue',
         chapterId: workspace.chapter.id,
         // Captured at the trigger, like every other long action in this file.
         generation: getWorkspaceGeneration(),
@@ -1883,9 +2349,9 @@ function renderInspectorControls(panel) {
     const copy = panel.querySelector('.sillynovel-inspector-copy');
 
     if (refresh) {
-        // Disabled while a Continue is measuring: that path hands this region
+        // Disabled while an action is measuring: that path hands this region
         // its capture for free, so refreshing now would pay for the same counts
-        // twice. Re-enabled from startContinue's finally.
+        // twice. Re-enabled when action measurement finishes.
         refresh.disabled = inspecting || building;
     }
 
@@ -1926,8 +2392,10 @@ function renderInspectorNote(panel) {
         return;
     }
 
+    const label = ACTIONS[inspection.action]?.label ?? 'action';
+
     note.textContent = `${INSPECTOR_NOTE} ${inspection.origin === 'sent'
-        ? 'This is the prompt that was assembled and sent for the last Continue.'
+        ? `This is the prompt that was assembled and sent for the last ${label}.`
         : 'Built from the editor. Nothing was sent.'}`;
 }
 
@@ -1978,10 +2446,14 @@ function renderInspectorFigures(panel) {
         : tokenFigure(figures.manuscriptTokens);
 
     const rows = [
+        ['Action', ACTIONS[figures.action]?.label ?? 'not reached — the refusal came first'],
         ['Context size', tokenFigure(figures.contextTokens)],
         ['Reply reserve', reserveFigure(figures)],
         ['Framing', tokenFigure(figures.framingTokens)],
         ['Writing Profile', figures.profileTokens === 0 ? 'empty — not sent' : tokenFigure(figures.profileTokens)],
+        ['Selection', figures.selectionTokens === 0
+            ? 'none — this action takes no selection'
+            : tokenFigure(figures.selectionTokens)],
         ['Safety margin', tokenFigure(figures.marginTokens)],
         ['Room left for the manuscript', tokenFigure(figures.allowanceTokens)],
         ['Manuscript sent', manuscript],
@@ -2142,9 +2614,10 @@ function inspectionTranscript() {
         return '';
     }
 
+    const label = ACTIONS[inspection.action]?.label ?? 'action';
     const lines = [
         inspection.origin === 'sent'
-            ? 'SillyNovel — the prompt assembled and sent for the last Continue'
+            ? `SillyNovel — the prompt assembled and sent for the last ${label}`
             : 'SillyNovel — prompt built from the editor; nothing was sent',
         '',
     ];
@@ -2249,7 +2722,7 @@ const PROFILE_CONFLICT_MESSAGE = 'The Writing Profile was changed somewhere else
 const PROFILE_TOO_LARGE_MESSAGE = 'This profile is too large to save. Shorten the longest fields — 8 KB each, '
     + '32 KB for prose examples.';
 
-/** True while a profile save is in flight. Never gates Continue. */
+/** True while a profile save is in flight. Never gates writing actions. */
 let profileSaving = false;
 
 /** @param {HTMLElement} panel */
@@ -2528,7 +3001,17 @@ function wireEditor(panel) {
         return;
     }
 
-    editor.addEventListener('input', () => { handleEditorChange(panel); });
+    // Located BEFORE the edit lands, while the selection still describes it.
+    editor.addEventListener('beforeinput', (event) => {
+        pendingEditStart = editStartFor(event, editor);
+    });
+
+    editor.addEventListener('input', () => {
+        // An input with no beforeinput ahead of it cannot be located: 0 breaks every anchor.
+        pendingEditStart ??= 0;
+        applyPendingEdit();
+        handleEditorChange(panel);
+    });
 
     editor.addEventListener('blur', () => {
         void autoSave(panel);
@@ -2576,8 +3059,17 @@ function wireEditor(panel) {
     panel.querySelector('.sillynovel-recovery-discard')
         ?.addEventListener('click', () => { void discardRecoveredDraft(panel); });
 
-    panel.querySelector('.sillynovel-continue')
-        ?.addEventListener('click', () => { void startContinue(panel); });
+    panel.querySelector('.sillynovel-actions')
+        ?.addEventListener('click', (event) => {
+            const button = event.target instanceof Element
+                ? event.target.closest('.sillynovel-action')
+                : null;
+            const action = button?.dataset.action;
+
+            if (action) {
+                void startAction(panel, action);
+            }
+        });
     panel.querySelector('.sillynovel-cancel')
         ?.addEventListener('click', () => { cancelGeneration(); });
 
@@ -2589,7 +3081,16 @@ function wireEditor(panel) {
             hidePreflight(panel);
 
             if (confirmed) {
-                void runGeneration(panel, confirmed.prompt, confirmed.target);
+                if (actionSnapshotIsCurrent(panel, confirmed.target)) {
+                    void runGeneration(panel, confirmed.prompt, confirmed.target);
+                } else {
+                    setActionNote(
+                        panel,
+                        'error',
+                        'The chapter or Writing Profile changed while confirmation was open. Run the action again.',
+                    );
+                    renderActionBar(panel);
+                }
             }
         });
 
@@ -2601,18 +3102,37 @@ function wireEditor(panel) {
             renderActionBar(panel);
         });
 
-    panel.querySelector('.sillynovel-insert')
-        ?.addEventListener('click', () => { insertSuggestion(panel); });
-    panel.querySelector('.sillynovel-copy')
-        ?.addEventListener('click', () => { void copySuggestion(panel); });
-    panel.querySelector('.sillynovel-discard')
-        ?.addEventListener('click', () => {
-            // Declining leaves the draft BYTE-IDENTICAL (PLAN.md:386) — this
-            // touches the pane and nothing else.
-            suggestion = null;
-            setSuggestionStatus(panel, null);
-            renderSuggestion(panel);
+    panel.querySelector('.sillynovel-suggestion-actions')
+        ?.addEventListener('click', (event) => {
+            const button = event.target instanceof Element
+                ? event.target.closest('.sillynovel-suggestion-action')
+                : null;
+
+            switch (button?.dataset.act) {
+                case 'insert':
+                    insertSuggestion(panel);
+                    break;
+                case 'replace':
+                    replaceSelection(panel);
+                    break;
+                case 'add-to-notes':
+                    addSuggestionToNotes(panel);
+                    break;
+                case 'copy':
+                    void copySuggestion(panel);
+                    break;
+                case 'discard':
+                    discardSuggestion(panel);
+                    break;
+                default:
+                    break;
+            }
         });
+
+    panel.querySelector('.sillynovel-history-previous')
+        ?.addEventListener('click', () => { moveSuggestionHistory(panel, -1); });
+    panel.querySelector('.sillynovel-history-next')
+        ?.addEventListener('click', () => { moveSuggestionHistory(panel, 1); });
 }
 
 /**
@@ -2655,12 +3175,15 @@ export function flushOnClose() {
         return;
     }
 
-    // ⚠️ The rendered suggestion is view state and goes with the panel. An
-    // in-flight GENERATION deliberately does not: closing does not cancel it
-    // (stopGeneration is global), so generate.js keeps it and a reopened panel
-    // shows it running, with Cancel. Clearing it here is what would put a live
-    // Continue button over a request the author is still paying for.
+    // Suggestions are panel-session state. The in-flight generation remains in
+    // generate.js so a reopened panel cannot start a second paid request.
     suggestion = null;
+    suggestionHistory.clear();
+    // The anchors belong to that history and to a mounted editor; both go.
+    selectionAnchors.clear();
+    pendingEditStart = null;
+    editorChapterId = null;
+    lastSeenText.clear();
     pendingPreflight = null;
     // The rendered prompt is view state too, and it holds a copy of the
     // manuscript. It goes when the panel goes.
