@@ -830,6 +830,14 @@ function renderWorkspaceContent(panel, workspace) {
     // note while something is running, so a message left over from the previous
     // chapter would otherwise survive the switch.
     setActionNote(panel, 'idle', '');
+
+    // After that reset, or it is wiped: a result that landed while no panel was
+    // open says so once, when its chapter is next shown.
+    if (suggestion && suggestion.chapterId === arrivedWhileClosed) {
+        arrivedWhileClosed = null;
+        setActionNote(panel, 'idle', 'This finished while the panel was closed.');
+    }
+
     renderActionBar(panel);
 
     // renderRecoveryOffer overwrites the editor with the draft when one stands,
@@ -1306,6 +1314,12 @@ function showSuggestion(panel, next) {
 
 /** @param {HTMLElement} panel @param {object} next */
 function appendSuggestion(panel, next) {
+    storeSuggestion(next);
+    showSuggestion(panel, next);
+}
+
+/** File a result as its chapter's current entry, without painting it. @param {object} next */
+function storeSuggestion(next) {
     const state = suggestionHistoryFor(next.chapterId, true);
 
     state.items.push(next);
@@ -1319,7 +1333,85 @@ function appendSuggestion(panel, next) {
     }
 
     state.index = state.items.length - 1;
-    showSuggestion(panel, next);
+}
+
+/** The chapter whose result arrived while no panel was open, to say so when it is shown. */
+let arrivedWhileClosed = null;
+
+/**
+ * Put an anchor back under tracking after a panel close dropped it.
+ *
+ * Nothing tracked edits in between, so the anchor holds only if the chapter
+ * still reads exactly as it did at the click. Checked now if the editor shows
+ * that chapter, otherwise when it next does: `setEditorText` compares the
+ * loaded text against what is recorded here.
+ *
+ * @param {SelectionAnchor} anchor
+ * @param {string} source the chapter text the action was started from
+ * @param {HTMLElement|null} live
+ */
+function adoptAnchor(anchor, source, live) {
+    if (selectionAnchors.has(anchor)) {
+        return;
+    }
+
+    selectionAnchors.add(anchor);
+
+    const editor = live ? editorOf(live) : null;
+
+    if (editor && editorChapterId === anchor.chapterId) {
+        if (editor.value !== source) {
+            anchor.broken = true;
+        }
+
+        return;
+    }
+
+    const seen = lastSeenText.get(anchor.chapterId);
+
+    if (seen === undefined) {
+        lastSeenText.set(anchor.chapterId, source);
+    } else if (seen !== source) {
+        anchor.broken = true;
+    }
+}
+
+/**
+ * Hand a finished result to its chapter, wherever the author is now.
+ *
+ * ⚠️ Never discarded. A close and reopen, or a chapter switch, used to drop a
+ * result the author had already paid for, with nothing on screen to say so.
+ * Filing it in its own chapter's history is safe: staleness and the selection
+ * anchor still guard Insert and Replace, and nothing is ever inserted.
+ *
+ * @param {HTMLElement} origin the panel the action was started from
+ * @param {object} next
+ * @param {string} chapterTitle
+ */
+function deliverSuggestion(origin, next, chapterTitle) {
+    const live = document.getElementById('sillynovel-panel');
+
+    if (next.selection) {
+        adoptAnchor(next.selection, next.source, live);
+    }
+
+    if (live && getWorkspace()?.chapter.id === next.chapterId) {
+        appendSuggestion(live, next);
+
+        if (live !== origin) {
+            setActionNote(live, 'idle', 'This finished while the panel was closed.');
+        }
+
+        return;
+    }
+
+    storeSuggestion(next);
+
+    if (live) {
+        setActionNote(live, 'idle', `A result for “${chapterTitle}” is ready in that chapter.`);
+    } else {
+        arrivedWhileClosed = next.chapterId;
+    }
 }
 
 /** @param {HTMLElement} panel @param {number} offset */
@@ -1516,10 +1608,22 @@ async function runGeneration(panel, prompt, target) {
     } catch (error) {
         // A superseded failure is not news: reporting an error about a chapter
         // the author has already left is noise, and the same reasoning
-        // session.js applies to stale saves.
-        if (panel.isConnected && isCurrentTarget(target.generation, target.chapterId)) {
-            renderGenerationError(panel, error, () => {
-                void startAction(panel, target.action, target.selection);
+        // session.js applies to stale saves. A close and reopen onto the SAME
+        // chapter is not a departure, though — the author is looking at it.
+        const live = document.getElementById('sillynovel-panel');
+        const reopenedOnTarget = live !== null && live !== panel
+            && getWorkspace()?.chapter.id === target.chapterId;
+
+        if (reopenedOnTarget && target.selection) {
+            // The error's Retry reuses this anchor, so it must be tracked again.
+            adoptAnchor(target.selection, target.source, live);
+        }
+
+        if ((panel.isConnected && isCurrentTarget(target.generation, target.chapterId)) || reopenedOnTarget) {
+            const shown = reopenedOnTarget ? live : panel;
+
+            renderGenerationError(shown, error, () => {
+                void startAction(shown, target.action, target.selection);
             });
         }
 
@@ -1540,17 +1644,13 @@ async function runGeneration(panel, prompt, target) {
     }
 
     // null means something was already running; the bar already says so.
-    if (result === null || !panel.isConnected) {
+    if (result === null) {
         return;
     }
 
-    // The workspace moved while this was in flight — a switch, or a close and
-    // reopen. The result belongs to a chapter that is no longer the target, so
-    // it is discarded rather than painted over whatever is on screen now.
-    if (!isCurrentTarget(result.generation, result.chapterId)) {
-        return;
-    }
-
+    // The workspace may have moved while this was in flight — a switch, or a
+    // close and reopen. deliverSuggestion files the result under its own
+    // chapter either way, rather than painting it over whatever is on screen.
     const check = validate(result.text, result.action);
     const nextSuggestion = {
         text: result.text,
@@ -1563,7 +1663,7 @@ async function runGeneration(panel, prompt, target) {
         warnings: check.warnings,
     };
 
-    appendSuggestion(panel, nextSuggestion);
+    deliverSuggestion(panel, nextSuggestion, target.chapterTitle);
 }
 
 /**
@@ -2375,8 +2475,26 @@ function renderInspectorStale(panel) {
     // path (ARCHITECTURE.md:165-166). Do not "improve" this into a rebuild.
     const profileUnchanged = inspection?.profileSource === null
         || renderProfileText(readProfileForm(panel)) === inspection?.profileSource;
+    const chapterChanged = Boolean(inspection && editor) && editor.value !== inspection.source;
+    const profileChanged = Boolean(inspection) && !profileUnchanged;
 
-    stale.hidden = !inspection || !editor || (editor.value === inspection.source && profileUnchanged);
+    stale.hidden = !inspection || !editor || (!chapterChanged && !profileChanged);
+
+    if (stale.hidden) {
+        return;
+    }
+
+    // Name what moved: blaming the chapter for a profile edit sends the author
+    // looking for a change that is not there.
+    let what = 'The chapter';
+
+    if (chapterChanged && profileChanged) {
+        what = 'The chapter and the Writing Profile';
+    } else if (profileChanged) {
+        what = 'The Writing Profile';
+    }
+
+    stale.textContent = `${what} changed after this was built, so it is no longer the prompt this action would send. Refresh to rebuild.`;
 }
 
 /** @param {HTMLElement} panel */
@@ -3184,6 +3302,7 @@ export function flushOnClose() {
     pendingEditStart = null;
     editorChapterId = null;
     lastSeenText.clear();
+    arrivedWhileClosed = null;
     pendingPreflight = null;
     // The rendered prompt is view state too, and it holds a copy of the
     // manuscript. It goes when the panel goes.
