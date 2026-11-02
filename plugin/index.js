@@ -27,7 +27,11 @@ import {
     listProjects,
     parseIfMatch,
     readChapter,
+    readNotes,
+    readProfile,
     writeChapter,
+    writeNotes,
+    writeProfile,
 } from './lib/store.js';
 
 export const info = {
@@ -120,7 +124,7 @@ function route(handler) {
  */
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.json({ ok: true, plugin: info.id, version: '0.2.0' });
+        response.json({ ok: true, plugin: info.id, version: '0.4.0' });
     });
 
     router.get('/projects', route(async (_request, response, root) => {
@@ -159,6 +163,42 @@ export async function init(router) {
             body?.content,
             expected,
         );
+        response.set('ETag', `"${result.etag}"`).json(result);
+    }));
+
+    // Per-chapter notes (Phase 3). The chapter's compare-and-swap discipline;
+    // an absent note reads as '' with the digest of '', and the chapter itself
+    // must exist.
+    router.get('/projects/:projectId/chapters/:chapterId/notes', route(async (request, response, root) => {
+        const result = await readNotes(root, request.params.projectId, request.params.chapterId);
+        response.set('ETag', `"${result.etag}"`).json(result);
+    }));
+
+    router.put('/projects/:projectId/chapters/:chapterId/notes', route(async (request, response, root) => {
+        const expected = parseIfMatch(request.get('If-Match'));
+        const body = await readJsonBody(request);
+        const result = await writeNotes(
+            root,
+            request.params.projectId,
+            request.params.chapterId,
+            body?.content,
+            expected,
+        );
+        response.set('ETag', `"${result.etag}"`).json(result);
+    }));
+
+    // The Writing Profile (Phase 3). Same compare-and-swap discipline as a
+    // chapter: If-Match required on PUT, the digest is of the file's own bytes,
+    // and an absent file reads as the canonical default rather than 404.
+    router.get('/projects/:projectId/profile', route(async (request, response, root) => {
+        const result = await readProfile(root, request.params.projectId);
+        response.set('ETag', `"${result.etag}"`).json(result);
+    }));
+
+    router.put('/projects/:projectId/profile', route(async (request, response, root) => {
+        const expected = parseIfMatch(request.get('If-Match'));
+        const body = await readJsonBody(request);
+        const result = await writeProfile(root, request.params.projectId, body?.profile, expected);
         response.set('ETag', `"${result.etag}"`).json(result);
     }));
 

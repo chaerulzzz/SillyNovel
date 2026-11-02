@@ -24,7 +24,16 @@ const SETTINGS_KEY = 'sillynovel';
  * second field here would give it two owners, and they would drift the moment
  * addChapter() refreshed one of them.
  *
- * @type {{project: {id: string, title: string, chapters: Array<{id: string, title: string}>}, chapter: {id: string, title: string}, content: string, etag: string}|null}
+ * `profile` is the Writing Profile as last read or saved, with its own etag: a
+ * separate document with a separate compare-and-swap, held here rather than
+ * in module state of its own so it has one owner and clears with the rest.
+ *
+ * `notes` is the open chapter's notes as last read or saved, with its own etag
+ * — a second document per chapter with its own compare-and-swap, and NO local
+ * recovery copy: the draft store is keyed by chapter alone, so a notes write
+ * there would overwrite the chapter's record.
+ *
+ * @type {{project: {id: string, title: string, chapters: Array<{id: string, title: string}>}, chapter: {id: string, title: string}, content: string, etag: string, profile: {data: object, etag: string}, notes: {content: string, etag: string}}|null}
  */
 let current = null;
 
@@ -124,6 +133,43 @@ let halted = null;
 let pendingOffer = null;
 
 /**
+ * The in-flight profile save, or null. Single-flight: the profile is one
+ * document, so there is nothing to key by.
+ *
+ * ⚠️ Like saveInFlight, deliberately NOT cleared by resetWorkspace(), and
+ * awaited before any re-read — a close-flush PUT that lands after a quick
+ * reopen's GET would leave the next save comparing against a revision the
+ * server has already moved past.
+ * @type {Promise<object|null>|null}
+ */
+let profileSaveInFlight = null;
+
+/**
+ * Why the profile has stopped saving, or null. PROJECT-scoped, and separate
+ * from `halted`: a chapter's conflict must not freeze the profile, nor the
+ * reverse. 413 is not a halt here — there is no autosave loop to stop, so the
+ * Save button stays live with a shorten message.
+ * @type {{projectId: string, reason: 'conflict'}|null}
+ */
+let profileHalt = null;
+
+/**
+ * In-flight notes saves, keyed by chapter id — per chapter like saveInFlight,
+ * and for the same reason deliberately NOT cleared by resetWorkspace().
+ * @type {Map<string, Promise<object|null>>}
+ */
+const notesSaveInFlight = new Map();
+
+/**
+ * Why the open chapter's notes have stopped saving, or null. Chapter-scoped
+ * and separate from `halted`: a chapter's conflict must not freeze its notes,
+ * nor the reverse. Same reasons as the chapter's, minus 'offer' — notes have
+ * no recovery store, so no offer can ever stand for them.
+ * @type {{chapterId: string, reason: 'conflict'|'oversize'}|null}
+ */
+let notesHalt = null;
+
+/**
  * The extension's settings bag.
  *
  * Lives here rather than in panel.js because this module owns the persisted
@@ -217,19 +263,38 @@ async function resolve() {
     }
 
     await settlePendingSave(chapter.id);
+    await settlePendingNotesSave(chapter.id);
 
-    const loaded = await api.getChapter(project.id, chapter.id);
+    // The notes are a second document per chapter and read beside it; a failed
+    // notes read aborts the open like any other read — without an etag no save
+    // is possible.
+    const [loaded, loadedNotes] = await Promise.all([
+        api.getChapter(project.id, chapter.id),
+        api.getNotes(project.id, chapter.id),
+    ]);
+
+    // ⚠️ A failed profile read aborts the resolve like every other read here.
+    // Opening without it would let Continue silently send without a
+    // never-dropped block (ARCHITECTURE.md:164), and without an etag no save
+    // is possible anyway. A plugin that has not been restarted answers this
+    // route with SillyTavern's HTML, which api.js reports as PLUGIN_ABSENT —
+    // whose message already says to restart.
+    await settlePendingProfileSave();
+    const loadedProfile = await api.getProfile(project.id);
 
     current = {
         project,
         chapter: { id: chapter.id, title: chapter.title },
         content: loaded.content,
         etag: loaded.etag,
+        profile: { data: loadedProfile.profile, etag: loadedProfile.etag },
+        notes: { content: loadedNotes.content, etag: loadedNotes.etag },
     };
 
     // A new workspace object: anything captured against the previous one is stale.
     workspaceGeneration += 1;
     halted = null;
+    notesHalt = null;
     pendingOffer = null;
 
     void recovery.pruneOldRecords();
@@ -281,11 +346,16 @@ export async function openChapter(chapterId, token = ++openToken) {
 
     const projectId = current.project.id;
     let loaded;
+    let loadedNotes;
 
     await settlePendingSave(chapterId);
+    await settlePendingNotesSave(chapterId);
 
     try {
-        loaded = await api.getChapter(projectId, chapterId);
+        [loaded, loadedNotes] = await Promise.all([
+            api.getChapter(projectId, chapterId),
+            api.getNotes(projectId, chapterId),
+        ]);
     } catch (error) {
         if (token !== openToken) {
             return null;
@@ -305,10 +375,12 @@ export async function openChapter(chapterId, token = ++openToken) {
     current.chapter = { id: chapterId, title: entry?.title ?? 'Untitled chapter' };
     current.content = loaded.content;
     current.etag = loaded.etag;
+    current.notes = { content: loadedNotes.content, etag: loadedNotes.etag };
 
-    // This read carries a fresh revision, so whatever halted saving on the way
-    // out no longer applies.
+    // These reads carry fresh revisions, so whatever halted saving on the way
+    // out no longer applies — for either document.
     halted = null;
+    notesHalt = null;
 
     // ⚠️ Only now, past the token and generation gate above. Evaluating on the
     // raw read would let a SUPERSEDED read for chapter A raise a banner over
@@ -701,4 +773,237 @@ export function resetWorkspace() {
     workspaceGeneration += 1;
     halted = null;
     pendingOffer = null;
+    profileHalt = null;
+    notesHalt = null;
+}
+
+/* --- the Writing Profile (Phase 3 checkpoint 2) --------------------------- */
+
+/** @returns {{data: object, etag: string}|null} */
+export function getProfile() {
+    return current?.profile ?? null;
+}
+
+/**
+ * Why the profile has stopped saving for the open project, or null.
+ * @returns {'conflict'|null}
+ */
+export function getProfileHalt() {
+    if (!current || !profileHalt || profileHalt.projectId !== current.project.id) {
+        return null;
+    }
+    return profileHalt.reason;
+}
+
+/**
+ * Is a captured profile action still speaking for the project open now?
+ *
+ * A project-scoped twin of isCurrentTarget(), not a widened one: the profile
+ * survives chapter switches, so a save started in chapter A must land after
+ * the author has moved to chapter B of the same project.
+ *
+ * @param {number} generation
+ * @param {string} projectId
+ */
+export function isCurrentProject(generation, projectId) {
+    return current !== null
+        && generation === workspaceGeneration
+        && current.project.id === projectId;
+}
+
+async function settlePendingProfileSave() {
+    if (!profileSaveInFlight) {
+        return;
+    }
+    try {
+        await profileSaveInFlight;
+    } catch {
+        // Deliberately ignored — the read that follows establishes the revision.
+    }
+}
+
+async function performProfileSave(projectId, generation, data, etag) {
+    let result;
+
+    try {
+        result = await api.putProfile(projectId, data, etag);
+    } catch (error) {
+        if (!isCurrentProject(generation, projectId)) {
+            return null;
+        }
+        if (error?.kind === api.ApiErrorKind.CONFLICT) {
+            profileHalt = { projectId, reason: 'conflict' };
+        }
+        throw error;
+    }
+
+    if (!isCurrentProject(generation, projectId)) {
+        return null;
+    }
+
+    // The server's own copy — unknown keys it preserved included — and the
+    // revision to compare against next time.
+    current.profile = { data: result.profile, etag: result.etag };
+
+    return current.profile;
+}
+
+/**
+ * Save the profile, as a compare-and-swap. Single-flight: a second call while
+ * one runs gets the RUNNING promise, which does not carry the newer data —
+ * the view re-checks dirtiness when it resolves, as it does for chapters.
+ *
+ * @param {object} data the whole profile object, unknown keys included
+ * @returns {Promise<{data: object, etag: string}|null>} null when halted or stale
+ */
+export function saveProfile(data) {
+    if (!current || getProfileHalt() !== null) {
+        return Promise.resolve(null);
+    }
+
+    if (profileSaveInFlight) {
+        return profileSaveInFlight;
+    }
+
+    const promise = performProfileSave(current.project.id, workspaceGeneration, data, current.profile.etag)
+        .finally(() => {
+            if (profileSaveInFlight === promise) {
+                profileSaveInFlight = null;
+            }
+        });
+
+    profileSaveInFlight = promise;
+
+    return promise;
+}
+
+/**
+ * Re-read the profile from the server and clear a conflict halt. The only way
+ * out of a conflict, and it REPLACES what is in memory — the view is expected
+ * to have told the author so before calling this.
+ *
+ * @returns {Promise<{data: object, etag: string}|null>}
+ */
+export async function reloadProfile() {
+    if (!current) {
+        return null;
+    }
+
+    const projectId = current.project.id;
+    const generation = workspaceGeneration;
+
+    await settlePendingProfileSave();
+    const loaded = await api.getProfile(projectId);
+
+    if (!isCurrentProject(generation, projectId)) {
+        return null;
+    }
+
+    current.profile = { data: loaded.profile, etag: loaded.etag };
+    profileHalt = null;
+
+    return current.profile;
+}
+
+/* --- per-chapter notes (Phase 3 checkpoint 3) ------------------------------ */
+
+/** @returns {{content: string, etag: string}|null} */
+export function getNotes() {
+    return current?.notes ?? null;
+}
+
+/**
+ * Why the open chapter's notes have stopped saving, or null.
+ * @returns {'conflict'|'oversize'|null}
+ */
+export function getNotesHalt() {
+    if (!notesHalt || !current || notesHalt.chapterId !== current.chapter.id) {
+        return null;
+    }
+    return notesHalt.reason;
+}
+
+export function clearNotesOversizeHalt() {
+    if (notesHalt?.reason === 'oversize') {
+        notesHalt = null;
+    }
+}
+
+async function settlePendingNotesSave(chapterId) {
+    const running = notesSaveInFlight.get(chapterId);
+
+    if (!running) {
+        return;
+    }
+
+    try {
+        await running;
+    } catch {
+        // Deliberately ignored — the read that follows establishes the revision.
+    }
+}
+
+/**
+ * performSave, minus the recovery settle: there is no local copy of notes to
+ * reconcile, and calling recovery here would overwrite the CHAPTER's record.
+ */
+async function performNotesSave(projectId, chapterId, generation, text, etag) {
+    let result;
+
+    try {
+        result = await api.putNotes(projectId, chapterId, text, etag);
+    } catch (error) {
+        if (!isCurrentTarget(generation, chapterId)) {
+            return null;
+        }
+
+        if (error?.kind === api.ApiErrorKind.CONFLICT) {
+            notesHalt = { chapterId, reason: 'conflict' };
+        } else if (error?.status === 413) {
+            notesHalt = { chapterId, reason: 'oversize' };
+        }
+
+        throw error;
+    }
+
+    if (!isCurrentTarget(generation, chapterId)) {
+        return null;
+    }
+
+    current.notes = { content: text, etag: result.etag };
+
+    return current.notes;
+}
+
+/**
+ * Save the open chapter's notes, as a compare-and-swap. Single-flight per
+ * chapter, coalescing like saveChapter: a caller during a running PUT gets
+ * that promise, which does not carry the newer text — the view re-checks
+ * dirtiness when it resolves.
+ *
+ * @param {string} text
+ * @returns {Promise<{content: string, etag: string}|null>}
+ */
+export function saveNotes(text) {
+    if (!current || getNotesHalt() !== null) {
+        return Promise.resolve(null);
+    }
+
+    const chapterId = current.chapter.id;
+    const running = notesSaveInFlight.get(chapterId);
+
+    if (running) {
+        return running;
+    }
+
+    const promise = performNotesSave(current.project.id, chapterId, workspaceGeneration, text, current.notes.etag)
+        .finally(() => {
+            if (notesSaveInFlight.get(chapterId) === promise) {
+                notesSaveInFlight.delete(chapterId);
+            }
+        });
+
+    notesSaveInFlight.set(chapterId, promise);
+
+    return promise;
 }

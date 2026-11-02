@@ -14,28 +14,40 @@ import { ApiErrorKind } from './api.js';
 import {
     acceptOffer,
     addChapter,
+    clearNotesOversizeHalt,
     clearOversizeHalt,
     declineOffer,
     getHalt,
+    getNotes,
+    getNotesHalt,
     getPendingOffer,
+    getProfile,
+    getProfileHalt,
     getWorkspaceGeneration,
     isCurrentTarget,
     recordDraft,
     getWorkspace,
     openChapter,
+    reloadProfile,
     resolveWorkspace,
     saveChapter,
+    saveNotes,
+    saveProfile,
 } from './session.js';
 import {
+    ACTIONS,
     GenerateErrorKind,
     PROMPT_BLOCKS,
+    buildPrompt,
     buildContinuePrompt,
+    renderProfileText,
     cancelGeneration,
     expandForDisplay,
     getActiveGeneration,
     needsPreflight,
-    runContinue,
+    runAction as runGenerationAction,
 } from './generate.js';
+import { validate } from './validate.js';
 
 const EXTENSION_NAME = 'sillynovel-writing';
 
@@ -67,9 +79,6 @@ const SAVE_STATUS = {
     conflict: CONFLICT_MESSAGE,
     error: 'Could not save',
 };
-
-/** Pending idle-save timer, or null. */
-let saveTimer = null;
 
 /**
  * Local recovery write delay. Much tighter than the server debounce because the
@@ -181,7 +190,7 @@ function renderRecoveryOffer(panel) {
     const editor = editorOf(panel);
 
     if (editor) {
-        editor.value = offer.draft;
+        setEditorText(editor, getWorkspace()?.chapter.id ?? null, offer.draft);
     }
 
     const message = panel.querySelector('.sillynovel-recovery-message');
@@ -239,7 +248,7 @@ async function discardRecoveredDraft(panel) {
     const editor = editorOf(panel);
 
     if (editor && workspace) {
-        editor.value = workspace.content;
+        setEditorText(editor, workspace.chapter.id, workspace.content);
     }
 
     renderRecoveryOffer(panel);
@@ -251,195 +260,361 @@ function editorOf(panel) {
     return panel.querySelector('.sillynovel-editor');
 }
 
-/**
- * Does the editor hold bytes the server does not?
- * @param {HTMLElement} panel
- */
-function isDirty(panel) {
-    const workspace = getWorkspace();
-    const editor = editorOf(panel);
+/* --- the per-document saver (Phase 3 checkpoint 3) ----------------------
 
-    return Boolean(workspace && editor) && editor.value !== workspace.content;
-}
-
-function cancelScheduledSave() {
-    if (saveTimer !== null) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-    }
-}
-
-/** @param {HTMLElement} panel */
-function scheduleSave(panel) {
-    cancelScheduledSave();
-    saveTimer = setTimeout(() => { void autoSave(panel); }, SAVE_DEBOUNCE_MS);
-}
+   Checkpoint 6 built this machine for the chapter on module-global state: one
+   timer, one status element, one dirty comparison. Notes need the same machine
+   for a second document, and a copy-pasted second machine is exactly where the
+   halt/settle semantics would drift. So the machine is a factory, and the
+   chapter is its first instance — configured to behave byte-for-byte as before,
+   with the old function names kept as destructured aliases so no call site
+   changed. What stays OUTSIDE the saver is chapter-only by nature: the local
+   draft timer and recovery offer, the stale marks, and setActionError. */
 
 /**
- * What to do once a save has settled, either way.
- *
- * ⚠️ This has to be STATE-aware, not merely content-aware. After a 412 the
- * editor still differs from the stored content, so a purely dirty-based check
- * would fire again immediately: PUT -> 412 -> settle -> PUT, forever, which is
- * the opposite of "autosave halts". And re-saving inline rather than re-arming
- * the debounce turns a transient 5xx into a tight retry loop with no pacing.
- *
- * @param {HTMLElement} panel
+ * @param {object} config
+ * @param {string} config.name for log lines
+ * @param {number} config.debounceMs idle delay before a save
+ * @param {(panel: HTMLElement) => string|null} config.read the textarea's text, null if absent
+ * @param {() => string|null} config.saved the server-held text, null if nothing is open
+ * @param {() => string|null} config.halt why saving has stopped, or null
+ * @param {(text: string) => Promise<object|null>} config.save the session.js save
+ * @param {(panel: HTMLElement, state: string, text?: string) => void} config.status
+ * @param {Record<string, [string, string|undefined]>} config.haltStatus what to paint per halt reason
  */
-function settleSave(panel) {
-    if (!panel.isConnected) {
-        cancelScheduledSave();
-        return;
+function createSaver({ name, debounceMs, read, saved, halt, save, status, haltStatus }) {
+    /** Pending idle-save timer, or null. Private to this document. */
+    let timer = null;
+
+    /** Does the textarea hold bytes the server does not? */
+    function isDirty(panel) {
+        const server = saved();
+        const text = read(panel);
+
+        return server !== null && text !== null && text !== server;
     }
 
-    if (getHalt() !== null) {
-        return;
+    function cancel() {
+        if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+        }
     }
 
-    if (isDirty(panel)) {
-        scheduleSave(panel);
-    }
-}
-
-/**
- * Put the halted status back on screen.
- *
- * runAction() writes a progress message ("Opening chapter…") into the same
- * region before it calls anything, so a navigation attempt on a halted chapter
- * would otherwise bury the very warning that explains why it was refused.
- *
- * @param {HTMLElement} panel
- * @returns {boolean} whether a halt was in force
- */
-function renderHaltStatus(panel) {
-    const halt = getHalt();
-
-    if (halt === 'offer') {
-        setSaveStatus(panel, 'offer', 'Choose which version to keep before saving.');
-        return true;
+    function schedule(panel) {
+        cancel();
+        timer = setTimeout(() => { void autoSave(panel); }, debounceMs);
     }
 
-    if (halt === 'conflict') {
-        setSaveStatus(panel, 'conflict');
-        return true;
-    }
-
-    if (halt === 'oversize') {
-        setSaveStatus(panel, 'error', 'This chapter is too large to save. Shorten it and saving will resume.');
-        return true;
-    }
-
-    return false;
-}
-
-/**
- * @param {HTMLElement} panel
- * @param {unknown} error
- */
-function renderSaveFailure(panel, error) {
-    if (error?.kind === ApiErrorKind.CONFLICT) {
-        setSaveStatus(panel, 'conflict');
-        return;
-    }
-
-    setSaveStatus(panel, 'error', error?.message ?? SAVE_STATUS.error);
-}
-
-/**
- * One save attempt. Never throws — the status region is the report.
- *
- * Three outcomes, not two: "still dirty" has to be distinguishable from
- * "failed", because saveChapter coalesces onto an in-flight PUT that may have
- * carried older text. Collapsing them would make a navigation flush abort on a
- * perfectly healthy coalesced save.
- *
- * @param {HTMLElement} panel
- * @returns {Promise<'clean'|'dirty'|'failed'>}
- */
-async function autoSave(panel) {
-    cancelScheduledSave();
-
-    if (renderHaltStatus(panel)) {
-        return 'failed';
-    }
-
-    if (!isDirty(panel)) {
-        // Nothing to send. Settle the status rather than leaving whatever the
-        // trigger left behind — "Unsaved changes" with nothing unsaved is a lie.
-        setSaveStatus(panel, 'idle');
-        return 'clean';
-    }
-
-    setSaveStatus(panel, 'saving');
-
-    try {
-        await saveChapter(editorOf(panel).value);
-
+    /**
+     * What to do once a save has settled, either way.
+     *
+     * ⚠️ This has to be STATE-aware, not merely content-aware. After a 412 the
+     * textarea still differs from the stored content, so a purely dirty-based
+     * check would fire again immediately: PUT -> 412 -> settle -> PUT, forever,
+     * which is the opposite of "autosave halts". And re-saving inline rather
+     * than re-arming the debounce turns a transient 5xx into a tight retry loop
+     * with no pacing.
+     */
+    function settle(panel) {
         if (!panel.isConnected) {
-            return 'failed';
+            cancel();
+            return;
+        }
+
+        if (halt() !== null) {
+            return;
         }
 
         if (isDirty(panel)) {
-            return 'dirty';
+            schedule(panel);
+        }
+    }
+
+    /**
+     * Put the halted status back on screen.
+     *
+     * runAction() writes a progress message ("Opening chapter…") into the
+     * chapter's region before it calls anything, so a navigation attempt on a
+     * halted document would otherwise bury the very warning that explains why
+     * it was refused.
+     *
+     * @returns {boolean} whether a halt was in force
+     */
+    function renderHalt(panel) {
+        const reason = halt();
+
+        if (reason === null || !(reason in haltStatus)) {
+            return false;
         }
 
-        setSaveStatus(panel, 'saved');
-        return 'clean';
-    } catch (error) {
-        console.error(`[${EXTENSION_NAME}] save failed`, error);
+        const [state, text] = haltStatus[reason];
+        status(panel, state, text);
+        return true;
+    }
 
-        if (panel.isConnected) {
-            renderSaveFailure(panel, error);
+    function renderFailure(panel, error) {
+        if (error?.kind === ApiErrorKind.CONFLICT) {
+            status(panel, 'conflict');
+            return;
         }
 
-        return 'failed';
-    } finally {
-        settleSave(panel);
+        status(panel, 'error', error?.message);
+    }
+
+    /**
+     * One save attempt. Never throws — the status region is the report.
+     *
+     * Three outcomes, not two: "still dirty" has to be distinguishable from
+     * "failed", because the session save coalesces onto an in-flight PUT that
+     * may have carried older text. Collapsing them would make a navigation
+     * flush abort on a perfectly healthy coalesced save.
+     *
+     * @returns {Promise<'clean'|'dirty'|'failed'>}
+     */
+    async function autoSave(panel) {
+        cancel();
+
+        if (renderHalt(panel)) {
+            return 'failed';
+        }
+
+        if (!isDirty(panel)) {
+            // Nothing to send. Settle the status rather than leaving whatever
+            // the trigger left behind — "Unsaved changes" with nothing unsaved
+            // is a lie.
+            status(panel, 'idle');
+            return 'clean';
+        }
+
+        status(panel, 'saving');
+
+        try {
+            await save(read(panel));
+
+            if (!panel.isConnected) {
+                return 'failed';
+            }
+
+            if (isDirty(panel)) {
+                return 'dirty';
+            }
+
+            status(panel, 'saved');
+            return 'clean';
+        } catch (error) {
+            console.error(`[${EXTENSION_NAME}] ${name} save failed`, error);
+
+            if (panel.isConnected) {
+                renderFailure(panel, error);
+            }
+
+            return 'failed';
+        } finally {
+            settle(panel);
+        }
+    }
+
+    /**
+     * Flush before leaving the chapter. Bounded rather than single-shot: the
+     * session save coalesces onto an in-flight PUT, which may have carried
+     * older text, so one pass is not always enough.
+     *
+     * @returns {Promise<boolean>} false means do NOT navigate
+     */
+    async function flush(panel) {
+        // A pending recovery OFFER is the deliberate exception to "a halt
+        // aborts navigation": the draft is durable in IndexedDB and the offer
+        // reappears when the author comes back, so there is nothing to lose by
+        // leaving. Chapter-only by construction — no other document has a
+        // recovery store, so no other halt() can ever return 'offer'. A
+        // conflict halt is different: that text exists nowhere else.
+        if (halt() === 'offer') {
+            return true;
+        }
+
+        // Already halted: nothing will save, so say so again rather than
+        // leaving whatever progress message the caller just wrote.
+        if (halt() !== null) {
+            renderHalt(panel);
+            return false;
+        }
+
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const outcome = await autoSave(panel);
+
+            if (outcome === 'clean') {
+                return true;
+            }
+
+            // A real failure aborts immediately rather than being retried here
+            // — pacing belongs to settle()'s debounce, not to a navigation click.
+            if (outcome === 'failed' || !panel.isConnected) {
+                return false;
+            }
+        }
+
+        return !isDirty(panel);
+    }
+
+    /** The consequences of the text changing, once the document-specific hooks have run. */
+    function handleChange(panel) {
+        // A conflict is sticky against every trigger. Showing "dirty" here
+        // would tell the author their words are about to be saved when they
+        // are not.
+        if (halt() !== null) {
+            return;
+        }
+
+        // Dirtiness is a comparison, not a consequence of typing: editing back
+        // to the saved text must not keep claiming there is something to save.
+        if (!isDirty(panel)) {
+            cancel();
+            status(panel, 'idle');
+            return;
+        }
+
+        status(panel, 'dirty');
+        schedule(panel);
+    }
+
+    /** Best-effort save as the panel closes. Fire-and-forget by necessity. */
+    function flushOnClose(panel) {
+        cancel();
+
+        if (halt() !== null || !isDirty(panel)) {
+            return;
+        }
+
+        void save(read(panel)).catch(() => {
+            // Nothing left to tell: the panel is going away.
+        });
+    }
+
+    return { isDirty, cancel, schedule, settle, renderHalt, renderFailure, autoSave, flush, handleChange, flushOnClose };
+}
+
+/** The chapter: the first instance, configured to behave exactly as checkpoint 6 built it. */
+const chapterSaver = createSaver({
+    name: 'chapter',
+    debounceMs: SAVE_DEBOUNCE_MS,
+    read: (panel) => editorOf(panel)?.value ?? null,
+    saved: () => getWorkspace()?.content ?? null,
+    halt: getHalt,
+    save: saveChapter,
+    status: setSaveStatus,
+    haltStatus: {
+        offer: ['offer', 'Choose which version to keep before saving.'],
+        conflict: ['conflict', undefined],
+        oversize: ['error', 'This chapter is too large to save. Shorten it and saving will resume.'],
+    },
+});
+
+// The checkpoint-6 names, so no call site in this file changed.
+const {
+    isDirty,
+    cancel: cancelScheduledSave,
+    schedule: scheduleSave,
+    renderHalt: renderHaltStatus,
+    autoSave,
+} = chapterSaver;
+
+const NOTES_CONFLICT_MESSAGE =
+    'These notes changed somewhere else, so your notes will not be saved. Copy them out of this box before '
+    + 'switching chapters, closing or reloading — they are not stored anywhere else.';
+
+/** The idle line is empty on purpose: it sits under a collapsed toggle and must stay quiet. */
+const NOTES_STATUS = {
+    idle: '',
+    dirty: 'Unsaved notes',
+    saving: 'Saving notes…',
+    saved: 'Notes saved',
+    conflict: NOTES_CONFLICT_MESSAGE,
+    error: 'Could not save notes',
+};
+
+/** @param {HTMLElement} panel */
+function notesEditorOf(panel) {
+    return panel.querySelector('.sillynovel-notes-editor');
+}
+
+/**
+ * @param {HTMLElement} panel
+ * @param {string} state
+ * @param {string} [text]
+ */
+function setNotesStatus(panel, state, text) {
+    const element = panel.querySelector('.sillynovel-notes-status');
+
+    if (element) {
+        element.dataset.state = state;
+        element.textContent = text ?? NOTES_STATUS[state] ?? '';
     }
 }
 
 /**
- * Flush before leaving the chapter — ARCHITECTURE.md:461 counts internal
- * navigation as a save trigger, and both openChapter and addChapter overwrite
- * the open chapter's content.
+ * Per-chapter notes: the second instance. No draft timer, no recovery offer,
+ * no stale marks — notes are not in the prompt at this checkpoint, and the
+ * recovery store is keyed by chapter alone, so a notes write there would
+ * overwrite the chapter's record.
+ */
+const notesSaver = createSaver({
+    name: 'notes',
+    debounceMs: SAVE_DEBOUNCE_MS,
+    read: (panel) => notesEditorOf(panel)?.value ?? null,
+    saved: () => getNotes()?.content ?? null,
+    halt: getNotesHalt,
+    save: saveNotes,
+    status: setNotesStatus,
+    haltStatus: {
+        conflict: ['conflict', undefined],
+        oversize: ['error', 'These notes are too large to save. Shorten them and saving will resume.'],
+    },
+});
+
+/** Every document with a saver, chapter first. */
+const SAVERS = [chapterSaver, notesSaver];
+
+/**
+ * Everything that must happen when the notes text changes, from ANY cause.
+ * A function, not an inline listener, so checkpoint 5's "Add to notes" can
+ * call it after a programmatic write — exactly as insertSuggestion calls
+ * handleEditorChange. Idempotent for the same reason.
  *
- * Bounded rather than single-shot: saveChapter coalesces onto an in-flight PUT,
- * which may have carried older text, so one pass is not always enough.
+ * @param {HTMLElement} panel
+ */
+function handleNotesChange(panel) {
+    // Shortening is the only thing that can fix a 413, so editing is exactly
+    // when saving should resume.
+    clearNotesOversizeHalt();
+    notesSaver.handleChange(panel);
+}
+
+/**
+ * Flush every document before leaving the chapter — ARCHITECTURE.md:461 counts
+ * internal navigation as a save trigger, and both openChapter and addChapter
+ * overwrite the open chapter's content. Every saver gets its attempt; any
+ * refusal aborts.
  *
  * @param {HTMLElement} panel
  * @returns {Promise<boolean>} false means do NOT navigate
  */
 async function flushBeforeNavigation(panel) {
-    // A pending offer is the deliberate exception to "a halt aborts navigation":
-    // the draft is durable in IndexedDB and the offer reappears when the author
-    // comes back, so there is nothing to lose by leaving. A conflict halt is
-    // different — that text exists nowhere else.
-    if (getHalt() === 'offer') {
-        return true;
+    let ok = true;
+
+    for (const saver of SAVERS) {
+        if (!(await saver.flush(panel))) {
+            ok = false;
+        }
     }
 
-    // Already halted: nothing will save, so say so again rather than leaving
-    // whatever progress message the caller just wrote.
-    if (getHalt() !== null) {
+    // A later saver's refusal must not leave "Opening chapter…" standing over
+    // the chapter's own halt or recovery banner.
+    if (!ok) {
         renderHaltStatus(panel);
-        return false;
     }
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-        const outcome = await autoSave(panel);
-
-        if (outcome === 'clean') {
-            return true;
-        }
-
-        // A real failure aborts immediately rather than being retried here —
-        // pacing belongs to settleSave()'s debounce, not to a navigation click.
-        if (outcome === 'failed' || !panel.isConnected) {
-            return false;
-        }
-    }
-
-    return !isDirty(panel);
+    return ok;
 }
 
 /**
@@ -629,13 +804,20 @@ function renderWorkspaceContent(panel, workspace) {
 
     const editor = panel.querySelector('.sillynovel-editor');
     if (editor) {
-        editor.value = workspace.content;
+        setEditorText(editor, workspace.chapter.id, workspace.content);
+    }
+
+    // Notes are chapter-scoped, so unlike the profile they ARE repainted here.
+    const notes = notesEditorOf(panel);
+    if (notes) {
+        notes.value = workspace.notes?.content ?? '';
     }
 
     renderNav(panel, workspace);
 
     cancelScheduledSave();
     cancelScheduledDraft();
+    notesSaver.cancel();
 
     // A suggestion belongs to the chapter it came from, and a trim notice to the
     // request that caused it. The action bar is repainted from the LIVE
@@ -648,6 +830,14 @@ function renderWorkspaceContent(panel, workspace) {
     // note while something is running, so a message left over from the previous
     // chapter would otherwise survive the switch.
     setActionNote(panel, 'idle', '');
+
+    // After that reset, or it is wiped: a result that landed while no panel was
+    // open says so once, when its chapter is next shown.
+    if (suggestion && suggestion.chapterId === arrivedWhileClosed) {
+        arrivedWhileClosed = null;
+        setActionNote(panel, 'idle', 'This finished while the panel was closed.');
+    }
+
     renderActionBar(panel);
 
     // renderRecoveryOffer overwrites the editor with the draft when one stands,
@@ -658,6 +848,10 @@ function renderWorkspaceContent(panel, workspace) {
         setSaveStatus(panel, 'idle');
     } else {
         renderHaltStatus(panel);
+    }
+
+    if (!notesSaver.renderHalt(panel)) {
+        setNotesStatus(panel, 'idle');
     }
 }
 
@@ -687,44 +881,153 @@ function handleEditorChange(panel) {
     // is exactly when saving should resume.
     clearOversizeHalt();
 
-    // A continuation is a continuation OF something. Once that something moves,
-    // say so rather than silently offering prose that no longer follows on.
+    // Once the source moves, say so rather than presenting the old result as current.
     renderSuggestionStale(panel);
 
     // Same reasoning, and the same string comparison: a displayed prompt that
-    // no longer matches the editor is no longer the prompt Continue would send.
+    // no longer matches the editor is no longer the prompt the action would send.
     renderInspectorStale(panel);
 
-    // A conflict is sticky against every trigger. Showing "dirty" here would
-    // tell the author their words are about to be saved when they are not.
-    if (getHalt() !== null) {
-        return;
-    }
-
-    // Dirtiness is a comparison, not a consequence of typing: editing back to
-    // the saved text must not keep claiming there is something to save.
-    if (!isDirty(panel)) {
-        cancelScheduledSave();
-        setSaveStatus(panel, 'idle');
-        return;
-    }
-
-    setSaveStatus(panel, 'dirty');
-    scheduleSave(panel);
+    chapterSaver.handleChange(panel);
 }
 
-/* --- Continue and the suggestion pane (checkpoint 8) --------------------- */
+/* --- writing actions and the suggestion pane ----------------------------- */
 
 /**
  * The suggestion currently on offer, or null. VIEW state: it is what the pane
  * is painting, not what the model is doing.
  *
- * `source` is the editor text the continuation was generated from, which is the
- * only way to tell later that the chapter has moved underneath it.
- *
- * @type {{text: string, chapterId: string, generation: number, source: string}|null}
+ * @type {{text: string, action: string, resultKind: string, chapterId: string,
+ *   generation: number, source: string,
+ *   selection: SelectionAnchor|null,
+ *   warnings: string[]}|null}
  */
 let suggestion = null;
+
+const SUGGESTION_HISTORY_LIMIT = 10;
+const suggestionHistory = new Map();
+
+/** @param {string} chapterId @param {boolean} [create] */
+function suggestionHistoryFor(chapterId, create = false) {
+    let state = suggestionHistory.get(chapterId);
+
+    if (!state && create) {
+        state = { items: [], index: null };
+        suggestionHistory.set(chapterId, state);
+    }
+
+    return state ?? null;
+}
+
+/* --- selection anchors ---------------------------------------------------- */
+
+/**
+ * @typedef {{start: number, end: number, text: string, chapterId: string, broken: boolean}} SelectionAnchor
+ */
+
+/**
+ * Every selection a Rewrite or Expand was asked about, from the click until its
+ * result leaves history. The same object is the target's `selection` and the
+ * suggestion's, so breaking it here is seen everywhere at once.
+ *
+ * ⚠️ Comparing text at the stored offsets is NOT enough. With the passage
+ * `S … S`, deleting the first S and the middle leaves the same editor text as
+ * deleting the middle and the second S — only where the edit happened tells
+ * the two apart. So every edit is located as it happens, and any edit that
+ * starts before an anchor's end breaks it for good.
+ *
+ * Anchors from a failed or cancelled run stay until the panel closes: the
+ * error's Retry reuses them, so they must keep tracking edits.
+ *
+ * @type {Set<SelectionAnchor>}
+ */
+const selectionAnchors = new Set();
+
+/** Where the edit about to land starts, recorded before it lands; null once applied. */
+let pendingEditStart = null;
+
+/** The chapter whose text the editor holds, and each chapter's text when last shown. */
+let editorChapterId = null;
+const lastSeenText = new Map();
+
+/**
+ * Where an edit starts, read in `beforeinput` while the selection still
+ * describes the range about to change. Anything that cannot be located says 0,
+ * which breaks every anchor: a false refusal is recoverable, a wrong
+ * replacement is not.
+ *
+ * @param {InputEvent} event
+ * @param {HTMLTextAreaElement} editor
+ */
+function editStartFor(event, editor) {
+    const { selectionStart: start, selectionEnd: end } = editor;
+    const type = event.inputType ?? '';
+
+    // Undo, redo and drag-and-drop change a range the selection does not describe.
+    if (type.startsWith('history') || type === 'insertFromDrop' || type === 'deleteByDrag') {
+        return 0;
+    }
+
+    if (start !== end || !type.startsWith('delete')) {
+        return start;
+    }
+
+    // A collapsed backward delete removes text BEFORE the caret. One step back
+    // is at most one grapheme; two code units covers a surrogate pair.
+    if (type === 'deleteContentBackward') {
+        return Math.max(0, start - 2);
+    }
+
+    // A word or line backwards can reach anywhere; forward deletes start at the caret.
+    return type.endsWith('Backward') ? 0 : start;
+}
+
+/** @param {string|null} chapterId @param {number} editStart */
+function breakAnchors(chapterId, editStart) {
+    for (const anchor of selectionAnchors) {
+        if (anchor.chapterId === chapterId && editStart < anchor.end) {
+            anchor.broken = true;
+        }
+    }
+}
+
+/** Apply the recorded edit, if the input handler has not already done so. */
+function applyPendingEdit() {
+    if (pendingEditStart !== null) {
+        breakAnchors(editorChapterId, pendingEditStart);
+        pendingEditStart = null;
+    }
+}
+
+/**
+ * Replace the editor's whole text — a chapter open, a recovery draft, a
+ * declined draft. Text that differs from what this chapter last showed moved
+ * underneath every anchor in it.
+ *
+ * @param {HTMLTextAreaElement} editor
+ * @param {string} chapterId
+ * @param {string} text
+ */
+function setEditorText(editor, chapterId, text) {
+    if (editorChapterId !== null) {
+        lastSeenText.set(editorChapterId, editor.value);
+    }
+
+    const previous = lastSeenText.get(chapterId);
+
+    if (previous !== undefined && previous !== text) {
+        breakAnchors(chapterId, 0);
+    }
+
+    editor.value = text;
+    editorChapterId = chapterId;
+    pendingEditStart = null;
+}
+
+/** @param {SelectionAnchor} anchor @param {HTMLTextAreaElement} editor */
+function anchorHolds(anchor, editor) {
+    return !anchor.broken && editor.value.slice(anchor.start, anchor.end) === anchor.text;
+}
 
 /** The preflight awaiting a decision, or null. */
 let pendingPreflight = null;
@@ -734,8 +1037,8 @@ let pendingPreflight = null;
  *
  * VIEW state, and a SNAPSHOT.
  *
- * ⚠️ Never the object buildContinuePrompt() returned and never an array
- * runContinue() sends. createRawPrompt mutates the array it is handed, in place
+ * ⚠️ Never the object buildPrompt() returned and never an array
+ * runAction() sends. createRawPrompt mutates the array it is handed, in place
  * (script.js:3886), so the array displayed must never be the array sent.
  *
  * ⚠️ `source` is the manuscript string the prompt was BUILT FROM, threaded
@@ -744,7 +1047,7 @@ let pendingPreflight = null;
  * during the tokenizer round trip — the region quietly claiming to show
  * something it is not.
  *
- * @type {{origin: 'built'|'sent', source: string, chapterId: string,
+ * @type {{origin: 'built'|'sent', action: string, source: string, chapterId: string,
  *   generation: number, messages: Array<object>, excluded: Array<object>,
  *   figures: object|null, refusal: {message: string, kind: string}|null}|null}
  */
@@ -753,13 +1056,13 @@ let inspection = null;
 /**
  * True while a prompt is being measured for the Inspector.
  *
- * Mirrors `building`, but it never gates Continue: inspecting costs no model
+ * Mirrors `building`, but it never gates writing actions: inspecting costs no model
  * request, so it must not disable the primary action.
  */
 let inspecting = false;
 
 /**
- * True from the moment Continue is accepted until the attempt ends.
+ * True from the moment an action is accepted until prompt measurement ends.
  *
  * ⚠️ Wider than generate.js's single-flight on purpose. That guard starts at
  * the model call, but getTokenCountAsync round-trips to the server, so there is
@@ -788,24 +1091,24 @@ function setActionNote(panel, state, text) {
 }
 
 /**
- * Paint Continue / Cancel from the LIVE generation, not from a local flag.
+ * Paint the action bar from the LIVE generation, not from a local flag.
  *
  * ⚠️ generate.js's in-flight state deliberately outlives the panel, so this is
  * the function that keeps a reopened panel honest: a request started before the
  * close is still running and still costing money, so the bar shows it — with
- * Cancel — rather than showing a Continue button that would buy a second one.
+ * Cancel — rather than showing an action button that would buy a second one.
  *
  * @param {HTMLElement} panel
  */
 function renderActionBar(panel) {
-    const continueButton = panel.querySelector('.sillynovel-continue');
+    const actionButtons = panel.querySelectorAll('.sillynovel-action');
     const cancelButton = panel.querySelector('.sillynovel-cancel');
     const workspace = getWorkspace();
     const running = getActiveGeneration();
 
-    if (continueButton) {
-        continueButton.hidden = running !== null;
-        continueButton.disabled = pendingPreflight !== null || building;
+    for (const button of actionButtons) {
+        button.hidden = running !== null;
+        button.disabled = pendingPreflight !== null || building;
     }
 
     if (cancelButton) {
@@ -816,15 +1119,14 @@ function renderActionBar(panel) {
         return;
     }
 
-    // Name the chapter when it is not the one on screen. The title comes from
-    // the capture rather than the nav: the workspace may have moved on, or been
-    // closed and reopened somewhere else entirely.
     const elsewhere = !workspace || workspace.chapter.id !== running.chapterId;
+    const progress = ACTIONS[running.action]?.progress ?? 'Generating…';
+    const progressElsewhere = `${progress.replace(/…$/, '')} in ${running.chapterTitle}…`;
 
     setActionNote(
         panel,
         'busy',
-        elsewhere ? `Generating in ${running.chapterTitle}…` : 'Generating…',
+        elsewhere ? progressElsewhere : progress,
     );
 }
 
@@ -837,8 +1139,18 @@ function renderSuggestionStale(panel) {
     }
 
     const editor = editorOf(panel);
+    let isStale = false;
 
-    stale.hidden = !suggestion || !editor || editor.value === suggestion.source;
+    if (suggestion && suggestion.resultKind !== 'notes' && editor) {
+        isStale = suggestion.selection
+            ? !anchorHolds(suggestion.selection, editor)
+            : editor.value !== suggestion.source;
+    }
+
+    stale.textContent = suggestion?.selection
+        ? 'The selected passage changed or moved, so this replacement is no longer anchored.'
+        : 'The chapter changed after this was generated, so it may no longer follow on.';
+    stale.hidden = !isStale;
 }
 
 /**
@@ -878,11 +1190,57 @@ function setSuggestionStatus(panel, state, text, retry) {
 }
 
 /** @param {HTMLElement} panel */
+function renderSuggestionHistory(panel) {
+    const controls = panel.querySelector('.sillynovel-suggestion-history');
+    const previous = panel.querySelector('.sillynovel-history-previous');
+    const next = panel.querySelector('.sillynovel-history-next');
+    const position = panel.querySelector('.sillynovel-history-position');
+    const state = suggestion ? suggestionHistoryFor(suggestion.chapterId) : null;
+    const index = state?.items.indexOf(suggestion) ?? -1;
+    const visible = index >= 0 && state.items.length > 1;
+
+    if (controls) {
+        controls.hidden = !visible;
+    }
+
+    if (previous) {
+        previous.disabled = !visible || index === 0;
+    }
+
+    if (next) {
+        next.disabled = !visible || index === state.items.length - 1;
+    }
+
+    if (position) {
+        position.textContent = visible ? `${index + 1} / ${state.items.length}` : '';
+    }
+}
+
+/** @param {string} act @param {string} label @param {{disabled?: boolean, title?: string}} [options] */
+function suggestionActionButton(act, label, { disabled = false, title = '' } = {}) {
+    const button = document.createElement('button');
+
+    button.type = 'button';
+    button.className = `sillynovel-suggestion-action sillynovel-${act}`;
+    button.dataset.act = act;
+    button.textContent = label;
+    button.disabled = disabled;
+    button.title = title;
+
+    return button;
+}
+
+/** @param {HTMLElement} panel */
 function renderSuggestion(panel) {
     const block = panel.querySelector('.sillynovel-suggestion');
     const empty = panel.querySelector('.sillynovel-suggestions-empty');
     const body = panel.querySelector('.sillynovel-suggestion-text');
+    const originalBlock = panel.querySelector('.sillynovel-suggestion-original-block');
+    const original = panel.querySelector('.sillynovel-suggestion-original');
+    const proposedLabel = panel.querySelector('.sillynovel-suggestion-proposed-label');
+    const actions = panel.querySelector('.sillynovel-suggestion-actions');
     const status = panel.querySelector('.sillynovel-suggestions-status');
+    const hasSelection = Boolean(suggestion?.selection && suggestion.resultKind === 'prose');
 
     if (block) {
         block.hidden = suggestion === null;
@@ -899,28 +1257,227 @@ function renderSuggestion(panel) {
         body.textContent = suggestion?.text ?? '';
     }
 
+    if (originalBlock) {
+        originalBlock.hidden = !hasSelection;
+    }
+
+    if (original) {
+        original.textContent = hasSelection ? suggestion.selection.text : '';
+    }
+
+    if (proposedLabel) {
+        proposedLabel.hidden = !hasSelection;
+    }
+
+    if (actions) {
+        if (!suggestion) {
+            actions.replaceChildren();
+        } else {
+            let primary;
+
+            if (suggestion.resultKind === 'notes') {
+                primary = suggestionActionButton('add-to-notes', 'Add to notes');
+            } else if (suggestion.selection) {
+                primary = suggestionActionButton('replace', 'Replace');
+            } else {
+                primary = suggestionActionButton('insert', 'Insert');
+            }
+
+            actions.replaceChildren(
+                primary,
+                suggestionActionButton('copy', 'Copy'),
+                suggestionActionButton('discard', 'Discard'),
+            );
+        }
+    }
+
+    renderSuggestionHistory(panel);
     renderSuggestionStale(panel);
 }
 
-/**
- * Drop whatever the pane is showing. Called on every chapter install.
- *
- * ⚠️ A suggestion belongs to the chapter it was generated from. Leaving it up
- * across a switch would put chapter A's continuation on screen above chapter B,
- * with an Insert button that writes A's prose into B.
- *
- * ⚠️ This clears VIEW state only. It must never reach into generate.js: the
- * request is still running and still cancellable, and forgetting it is what
- * would let a second one be bought.
- *
- * @param {HTMLElement} panel
- */
-function clearSuggestion(panel) {
-    suggestion = null;
-    pendingPreflight = null;
+/** @param {HTMLElement} panel @param {object|null} next */
+function showSuggestion(panel, next) {
+    suggestion = next;
     setSuggestionStatus(panel, null);
-    hidePreflight(panel);
     renderSuggestion(panel);
+
+    if (next?.warnings?.length) {
+        const retryTarget = next;
+        setSuggestionStatus(
+            panel,
+            'warning',
+            `${next.warnings.join(' ')} Review before using, or retry.`,
+            () => { void startAction(panel, retryTarget.action, retryTarget.selection); },
+        );
+    }
+}
+
+/** @param {HTMLElement} panel @param {object} next */
+function appendSuggestion(panel, next) {
+    storeSuggestion(next);
+    showSuggestion(panel, next);
+}
+
+/** File a result as its chapter's current entry, without painting it. @param {object} next */
+function storeSuggestion(next) {
+    const state = suggestionHistoryFor(next.chapterId, true);
+
+    state.items.push(next);
+
+    if (state.items.length > SUGGESTION_HISTORY_LIMIT) {
+        const evicted = state.items.shift();
+
+        if (evicted?.selection) {
+            selectionAnchors.delete(evicted.selection);
+        }
+    }
+
+    state.index = state.items.length - 1;
+}
+
+/** The chapter whose result arrived while no panel was open, to say so when it is shown. */
+let arrivedWhileClosed = null;
+
+/**
+ * Put an anchor back under tracking after a panel close dropped it.
+ *
+ * Nothing tracked edits in between, so the anchor holds only if the chapter
+ * still reads exactly as it did at the click. Checked now if the editor shows
+ * that chapter, otherwise when it next does: `setEditorText` compares the
+ * loaded text against what is recorded here.
+ *
+ * @param {SelectionAnchor} anchor
+ * @param {string} source the chapter text the action was started from
+ * @param {HTMLElement|null} live
+ */
+function adoptAnchor(anchor, source, live) {
+    if (selectionAnchors.has(anchor)) {
+        return;
+    }
+
+    selectionAnchors.add(anchor);
+
+    const editor = live ? editorOf(live) : null;
+
+    if (editor && editorChapterId === anchor.chapterId) {
+        if (editor.value !== source) {
+            anchor.broken = true;
+        }
+
+        return;
+    }
+
+    const seen = lastSeenText.get(anchor.chapterId);
+
+    if (seen === undefined) {
+        lastSeenText.set(anchor.chapterId, source);
+    } else if (seen !== source) {
+        anchor.broken = true;
+    }
+}
+
+/**
+ * Hand a finished result to its chapter, wherever the author is now.
+ *
+ * ⚠️ Never discarded. A close and reopen, or a chapter switch, used to drop a
+ * result the author had already paid for, with nothing on screen to say so.
+ * Filing it in its own chapter's history is safe: staleness and the selection
+ * anchor still guard Insert and Replace, and nothing is ever inserted.
+ *
+ * @param {HTMLElement} origin the panel the action was started from
+ * @param {object} next
+ * @param {string} chapterTitle
+ */
+function deliverSuggestion(origin, next, chapterTitle) {
+    const live = document.getElementById('sillynovel-panel');
+
+    if (next.selection) {
+        adoptAnchor(next.selection, next.source, live);
+    }
+
+    if (live && getWorkspace()?.chapter.id === next.chapterId) {
+        appendSuggestion(live, next);
+
+        if (live !== origin) {
+            setActionNote(live, 'idle', 'This finished while the panel was closed.');
+        }
+
+        return;
+    }
+
+    storeSuggestion(next);
+
+    if (live) {
+        setActionNote(live, 'idle', `A result for “${chapterTitle}” is ready in that chapter.`);
+    } else {
+        arrivedWhileClosed = next.chapterId;
+    }
+}
+
+/** @param {HTMLElement} panel @param {number} offset */
+function moveSuggestionHistory(panel, offset) {
+    if (!suggestion) {
+        return;
+    }
+
+    const state = suggestionHistoryFor(suggestion.chapterId);
+    const index = state?.items.indexOf(suggestion) ?? -1;
+    const nextIndex = index + offset;
+
+    if (!state || nextIndex < 0 || nextIndex >= state.items.length) {
+        return;
+    }
+
+    state.index = nextIndex;
+    showSuggestion(panel, state.items[nextIndex]);
+}
+
+/** @param {HTMLElement} panel @param {boolean} revealPrevious */
+function removeCurrentSuggestion(panel, revealPrevious) {
+    if (!suggestion) {
+        return;
+    }
+
+    const state = suggestionHistoryFor(suggestion.chapterId);
+    const index = state?.items.indexOf(suggestion) ?? -1;
+
+    if (!state || index < 0) {
+        showSuggestion(panel, null);
+        return;
+    }
+
+    state.items.splice(index, 1);
+
+    if (suggestion.selection) {
+        selectionAnchors.delete(suggestion.selection);
+    }
+
+    if (state.items.length === 0) {
+        suggestionHistory.delete(suggestion.chapterId);
+        showSuggestion(panel, null);
+        return;
+    }
+
+    if (!revealPrevious) {
+        state.index = null;
+        showSuggestion(panel, null);
+        return;
+    }
+
+    state.index = index > 0 ? index - 1 : 0;
+    showSuggestion(panel, state.items[state.index]);
+}
+
+/** Restore only the current chapter's in-memory suggestion. @param {HTMLElement} panel */
+function clearSuggestion(panel) {
+    pendingPreflight = null;
+    hidePreflight(panel);
+
+    const chapterId = getWorkspace()?.chapter.id;
+    const state = chapterId ? suggestionHistoryFor(chapterId) : null;
+    const next = state && state.index !== null ? state.items[state.index] ?? null : null;
+
+    showSuggestion(panel, next);
 }
 
 /** @param {HTMLElement} panel */
@@ -934,7 +1491,7 @@ function hidePreflight(panel) {
 
 /**
  * @param {HTMLElement} panel
- * @param {object|null} prompt a buildContinuePrompt() result, or null to clear
+ * @param {object|null} prompt a buildPrompt() result, or null to clear
  */
 function renderTrimNote(panel, prompt) {
     const note = panel.querySelector('.sillynovel-trim-note');
@@ -978,8 +1535,6 @@ function showPreflight(panel, prompt, target) {
         return;
     }
 
-    // `building` is released when startContinue returns; the preflight keeps the
-    // button disabled on its own until the author answers.
     pendingPreflight = { prompt, target };
 
     const scope = prompt.trimmed
@@ -988,8 +1543,20 @@ function showPreflight(panel, prompt, target) {
 
     message.textContent = [
         'This is a large request.',
+        `Action: ${ACTIONS[prompt.action]?.label ?? prompt.action}.`,
         `Scope: ${scope}.`,
-        `About ${prompt.inputTokens} input tokens, plus up to ${prompt.reserveTokens} for the reply.`,
+        ...(prompt.selectionWords > 0
+            ? [`Selected passage: ~${prompt.selectionWords} words.`]
+            : []),
+        `About ${prompt.inputTokens} input tokens, plus up to ${prompt.reserveTokens} for the reply`
+            + (prompt.reserveSource === 'raised-by-sillynovel'
+                ? ` (raised by SillyNovel from your ${prompt.authorReserveTokens}).`
+                : '.'),
+        ...(prompt.profileTokens > 0 ? [`Of those input tokens, the Writing Profile is ${prompt.profileTokens}.`] : []),
+        ...(prompt.selectionTokens > 0 ? [`The selected passage is ${prompt.selectionTokens} tokens.`] : []),
+        ...(ACTIONS[prompt.action]?.resultKind === 'notes'
+            ? ['The result will be notes, not manuscript prose.']
+            : []),
         'Requests: 1.',
         'The price is not known — SillyNovel cannot see your provider’s rates.',
     ].join('\n');
@@ -1004,7 +1571,9 @@ function showPreflight(panel, prompt, target) {
  *
  * @param {HTMLElement} panel
  * @param {object} prompt
- * @param {{chapterId: string, chapterTitle: string, generation: number}} target
+ * @param {{action: string, chapterId: string, chapterTitle: string, generation: number,
+ *   source: string, profileSource: string,
+ *   selection: {start: number, end: number, text: string}|null}} target
  */
 async function runGeneration(panel, prompt, target) {
     // ⚠️ The previous suggestion is superseded the moment a new one is asked
@@ -1016,20 +1585,19 @@ async function runGeneration(panel, prompt, target) {
     setSuggestionStatus(panel, null);
     renderSuggestion(panel);
 
-    // The prompt startContinue captured is now the one going out.
     markInspectionSent(target);
     renderInspection(panel);
 
-    // ⚠️ Started BEFORE the bar is painted, and awaited after. runContinue
+    // ⚠️ Started BEFORE the bar is painted, and awaited after. runAction
     // registers the generation synchronously, before its own first await, so
     // calling it first is what lets renderActionBar see one. Painting first and
     // calling second — the natural order to write — leaves the bar showing
-    // "Measuring the prompt…" with Continue disabled and CANCEL HIDDEN for the
+    // "Measuring the prompt…" with actions disabled and CANCEL HIDDEN for the
     // whole request, in the one chapter the author is most likely watching: the
-    // one they pressed Continue in. Nothing else repaints until the generation
+    // one they invoked the action in. Nothing else repaints until generation
     // ends, so the cancellable "Generating…" state PLAN.md:447 asks for would
     // exist only for authors who happened to navigate away.
-    const pending = runContinue({ prompt, ...target });
+    const pending = runGenerationAction({ prompt, ...target });
 
     renderActionBar(panel);
 
@@ -1040,9 +1608,23 @@ async function runGeneration(panel, prompt, target) {
     } catch (error) {
         // A superseded failure is not news: reporting an error about a chapter
         // the author has already left is noise, and the same reasoning
-        // session.js applies to stale saves.
-        if (panel.isConnected && isCurrentTarget(target.generation, target.chapterId)) {
-            renderGenerationError(panel, error, () => { void startContinue(panel); });
+        // session.js applies to stale saves. A close and reopen onto the SAME
+        // chapter is not a departure, though — the author is looking at it.
+        const live = document.getElementById('sillynovel-panel');
+        const reopenedOnTarget = live !== null && live !== panel
+            && getWorkspace()?.chapter.id === target.chapterId;
+
+        if (reopenedOnTarget && target.selection) {
+            // The error's Retry reuses this anchor, so it must be tracked again.
+            adoptAnchor(target.selection, target.source, live);
+        }
+
+        if ((panel.isConnected && isCurrentTarget(target.generation, target.chapterId)) || reopenedOnTarget) {
+            const shown = reopenedOnTarget ? live : panel;
+
+            renderGenerationError(shown, error, () => {
+                void startAction(shown, target.action, target.selection);
+            });
         }
 
         return;
@@ -1062,25 +1644,26 @@ async function runGeneration(panel, prompt, target) {
     }
 
     // null means something was already running; the bar already says so.
-    if (result === null || !panel.isConnected) {
+    if (result === null) {
         return;
     }
 
-    // The workspace moved while this was in flight — a switch, or a close and
-    // reopen. The result belongs to a chapter that is no longer the target, so
-    // it is discarded rather than painted over whatever is on screen now.
-    if (!isCurrentTarget(result.generation, result.chapterId)) {
-        return;
-    }
-
-    suggestion = {
+    // The workspace may have moved while this was in flight — a switch, or a
+    // close and reopen. deliverSuggestion files the result under its own
+    // chapter either way, rather than painting it over whatever is on screen.
+    const check = validate(result.text, result.action);
+    const nextSuggestion = {
         text: result.text,
+        action: result.action,
+        resultKind: ACTIONS[result.action]?.resultKind ?? 'prose',
         chapterId: result.chapterId,
         generation: result.generation,
-        source: editorOf(panel)?.value ?? '',
+        source: target.source,
+        selection: target.selection,
+        warnings: check.warnings,
     };
 
-    renderSuggestion(panel);
+    deliverSuggestion(panel, nextSuggestion, target.chapterTitle);
 }
 
 /**
@@ -1103,11 +1686,17 @@ function renderGenerationError(panel, error, retry) {
 }
 
 /**
- * Continue: assemble, price, then ask.
- *
  * @param {HTMLElement} panel
+ * @param {string} action
+ * @param {{start: number, end: number, text: string}|null} [presetSelection]
  */
-async function startContinue(panel) {
+async function startAction(panel, action, presetSelection = null) {
+    const config = ACTIONS[action];
+
+    if (!config) {
+        return;
+    }
+
     // ⚠️ A pending recovery offer blocks this, reusing checkpoint 7's halt
     // predicate. The editor holds the draft while the server holds something
     // else, so generating from one of two unreconciled versions and then
@@ -1132,20 +1721,44 @@ async function startContinue(panel) {
         return;
     }
 
+    const editor = editorOf(panel);
+    const source = editor?.value ?? '';
+    const profile = readProfileForm(panel);
+    const profileSource = renderProfileText(profile);
+    let selection = null;
+
+    if (config.needsSelection) {
+        const start = presetSelection?.start ?? editor?.selectionStart ?? 0;
+        const end = presetSelection?.end ?? editor?.selectionEnd ?? 0;
+        const text = presetSelection?.text ?? source.slice(start, end);
+
+        // A retry inherits the earlier anchor, so an edit that broke it breaks the retry too.
+        if (presetSelection && (!editor || !anchorHolds(presetSelection, editor))) {
+            setActionNote(panel, 'error', 'The selected passage changed. Select it again and rerun the action.');
+            return;
+        }
+
+        if (text.trim() === '') {
+            setActionNote(panel, 'error', `Select a passage to ${action} first.`);
+            return;
+        }
+
+        selection = { start, end, text, chapterId: workspace.chapter.id, broken: false };
+        selectionAnchors.add(selection);
+    }
+
     const target = {
+        action,
         chapterId: workspace.chapter.id,
         chapterTitle: workspace.chapter.title,
-        // Captured at the CLICK, like every other long action in this codebase.
         generation: getWorkspaceGeneration(),
+        source,
+        profileSource,
+        selection,
     };
 
     setSuggestionStatus(panel, null);
     setActionNote(panel, 'busy', 'Measuring the prompt…');
-
-    // ⚠️ Read ONCE and threaded through, so the string the prompt is built
-    // from is the same string the Inspector later compares against for
-    // staleness. Reading the editor again after the await would let them differ.
-    const source = editorOf(panel)?.value ?? '';
 
     building = true;
     renderActionBar(panel);
@@ -1155,10 +1768,11 @@ async function startContinue(panel) {
         let prompt;
 
         try {
-            // The EDITOR, not the saved copy: with a 2 s debounce the paragraph
-            // the author just typed is usually still unsaved, and continuing
-            // from the server's version would silently ignore it.
-            prompt = await buildContinuePrompt(source);
+            prompt = await buildPrompt(action, {
+                manuscript: source,
+                selection: selection?.text ?? '',
+                profile,
+            });
         } catch (error) {
             if (panel.isConnected) {
                 setActionNote(panel, 'error', error?.message ?? 'That did not work.');
@@ -1174,14 +1788,15 @@ async function startContinue(panel) {
             return;
         }
 
-        // Token counting is async and can round-trip to the server, so the
-        // workspace may have moved while it ran.
         if (!panel.isConnected || !isCurrentTarget(target.generation, target.chapterId)) {
             return;
         }
 
-        // Free: startContinue already built this prompt, so the Inspector costs
-        // no additional token counts on this path.
+        if (!actionSnapshotIsCurrent(panel, target)) {
+            setActionNote(panel, 'error', 'The chapter or Writing Profile changed while the prompt was measured. Run the action again.');
+            return;
+        }
+
         captureInspection(prompt, target, source, 'built');
         renderInspection(panel);
 
@@ -1208,6 +1823,16 @@ async function startContinue(panel) {
     }
 }
 
+/** @param {HTMLElement} panel @param {object} target */
+function actionSnapshotIsCurrent(panel, target) {
+    const editor = editorOf(panel);
+
+    return Boolean(editor)
+        && isCurrentTarget(target.generation, target.chapterId)
+        && editor.value === target.source
+        && renderProfileText(readProfileForm(panel)) === target.profileSource;
+}
+
 /**
  * Take the suggestion into the manuscript.
  *
@@ -1216,7 +1841,7 @@ async function startContinue(panel) {
 function insertSuggestion(panel) {
     const editor = editorOf(panel);
 
-    if (!suggestion || !editor) {
+    if (!suggestion || suggestion.resultKind !== 'prose' || suggestion.selection || !editor) {
         return;
     }
 
@@ -1236,6 +1861,7 @@ function insertSuggestion(panel) {
     // to keep writing.
     editor.focus();
     editor.setSelectionRange(existing.length, existing.length);
+    pendingEditStart = existing.length;
 
     let inserted = false;
 
@@ -1262,9 +1888,10 @@ function insertSuggestion(panel) {
     // The status line goes with it: a "Copied." left over from before the insert
     // describes a suggestion that is now manuscript, and it also suppresses the
     // pane's own empty hint, so the pane ends up saying nothing true at all.
-    suggestion = null;
-    setSuggestionStatus(panel, null);
-    renderSuggestion(panel);
+    removeCurrentSuggestion(panel, false);
+
+    // The fallback assignment fires no input event, so nothing applied the edit yet.
+    applyPendingEdit();
 
     // ⚠️ Called on BOTH paths, including the one where execCommand fired
     // `input` natively. A `true` return says the edit was applied, not that an
@@ -1272,6 +1899,111 @@ function insertSuggestion(panel) {
     // should not rest on that distinction holding in every browser. The call is
     // idempotent, so the redundant one costs nothing.
     handleEditorChange(panel);
+}
+
+/** @param {HTMLElement} panel */
+function replaceSelection(panel) {
+    const editor = editorOf(panel);
+
+    if (!suggestion || suggestion.resultKind !== 'prose' || !suggestion.selection || !editor) {
+        return;
+    }
+
+    const { start, end } = suggestion.selection;
+
+    // ⚠️ The anchor, not the text at its offsets: an identical passage can slide
+    // into those offsets after the selected one is deleted.
+    if (!anchorHolds(suggestion.selection, editor)) {
+        setSuggestionStatus(
+            panel,
+            'error',
+            'The passage you selected has changed or moved, so it cannot be replaced safely. Select it again and retry, or copy the rewrite.',
+        );
+        renderSuggestion(panel);
+        return;
+    }
+
+    const existing = editor.value;
+    const replacement = suggestion.text;
+
+    editor.focus();
+    editor.setSelectionRange(start, end);
+    // Other results in this chapter's history may be anchored after this one.
+    pendingEditStart = start;
+
+    let inserted = false;
+
+    try {
+        inserted = document.execCommand('insertText', false, replacement);
+    } catch {
+        inserted = false;
+    }
+
+    if (!inserted) {
+        editor.value = existing.slice(0, start) + replacement + existing.slice(end);
+        const caret = start + replacement.length;
+        editor.setSelectionRange(caret, caret);
+    }
+
+    removeCurrentSuggestion(panel, false);
+    applyPendingEdit();
+    handleEditorChange(panel);
+}
+
+/** @param {HTMLElement} panel */
+function expandNotes(panel) {
+    const toggle = panel.querySelector('.sillynovel-notes-toggle');
+    const body = panel.querySelector('.sillynovel-notes-body');
+
+    if (toggle && body) {
+        toggle.setAttribute('aria-expanded', 'true');
+        body.hidden = false;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function addSuggestionToNotes(panel) {
+    const notes = notesEditorOf(panel);
+
+    if (!suggestion || suggestion.resultKind !== 'notes' || !notes) {
+        return;
+    }
+
+    expandNotes(panel);
+
+    if (getNotesHalt() !== null) {
+        notesSaver.renderHalt(panel);
+        setSuggestionStatus(panel, 'error', 'Resolve the notes save problem before adding more.');
+        return;
+    }
+
+    const existing = notes.value;
+    const payload = (existing.trim() ? '\n\n' : '') + suggestion.text;
+
+    notes.focus();
+    notes.setSelectionRange(existing.length, existing.length);
+
+    let inserted = false;
+
+    try {
+        inserted = document.execCommand('insertText', false, payload);
+    } catch {
+        inserted = false;
+    }
+
+    if (!inserted) {
+        notes.value = existing + payload;
+        notes.setSelectionRange(notes.value.length, notes.value.length);
+    }
+
+    removeCurrentSuggestion(panel, false);
+    handleNotesChange(panel);
+}
+
+/** @param {HTMLElement} panel */
+function discardSuggestion(panel) {
+    // Rejection changes only the pane; neither manuscript nor notes is touched.
+    removeCurrentSuggestion(panel, true);
 }
 
 /**
@@ -1340,9 +2072,10 @@ async function copySuggestion(panel) {
         return;
     }
 
-    const copied = await copyToClipboard(suggestion.text);
+    const target = suggestion;
+    const copied = await copyToClipboard(target.text);
 
-    if (!panel.isConnected) {
+    if (!panel.isConnected || suggestion !== target) {
         return;
     }
 
@@ -1387,14 +2120,33 @@ const INSPECTOR_NOTE = 'This is the prompt SillyNovel assembles, with macros exp
  * can be visibly longer than the number beside it claims.
  */
 const COUNT_CAVEAT = 'Framing is the instruction, the contract and the [MANUSCRIPT] header line '
-    + 'counted as one joined string, so there are no per-block figures. All counts are taken '
-    + 'before macros expand — SillyTavern expands them after we count, and the safety margin is '
-    + 'what covers the difference, along with the chat envelope no per-block count sees.';
+    + 'counted as one joined string, so those have no per-block figures; the Writing Profile, '
+    + 'selection and manuscript are counted on their own and shown beside their blocks. All counts are '
+    + 'taken before macros expand — SillyTavern expands them after we count, and the safety '
+    + 'margin is what covers the difference, along with the chat envelope no per-block count sees.';
 
 const RESERVE_SOURCE_LABEL = {
     provider: 'from your API settings',
     fallback: "SillyNovel's fallback — this backend exposes none",
+    'raised-by-sillynovel': 'raised by SillyNovel',
 };
+
+/**
+ * The reply-reserve figure, saying where the number came from — and, when
+ * SillyNovel raised it, what it was raised FROM, since that is the setting the
+ * author can actually see in their API panel.
+ *
+ * @param {{reserveTokens: number|null, authorReserveTokens?: number|null, reserveSource: string}} figures
+ */
+function reserveFigure(figures) {
+    const base = tokenFigure(figures.reserveTokens);
+
+    if (figures.reserveSource === 'raised-by-sillynovel' && typeof figures.authorReserveTokens === 'number') {
+        return `${base} · raised by SillyNovel from ${figures.authorReserveTokens.toLocaleString()} in your API settings`;
+    }
+
+    return `${base} · ${RESERVE_SOURCE_LABEL[figures.reserveSource] ?? 'source unknown'}`;
+}
 
 /** @param {HTMLElement} panel */
 function isInspectorOpen(panel) {
@@ -1451,14 +2203,18 @@ function blockFor(prompt, label) {
  * provider credentials, and an allowlist of numbers cannot become a key dump.
  * The guard is a grep over this file finding no such reads at all.
  *
- * @param {object} prompt a buildContinuePrompt() result
+ * @param {object} prompt a buildPrompt() result
  */
 function figuresFromPrompt(prompt) {
     return {
+        action: prompt.action,
         contextTokens: prompt.contextTokens,
         reserveTokens: prompt.reserveTokens,
+        authorReserveTokens: prompt.authorReserveTokens ?? null,
         reserveSource: prompt.reserveSource,
         framingTokens: prompt.framingTokens,
+        profileTokens: prompt.profileTokens ?? null,
+        selectionTokens: prompt.selectionTokens ?? null,
         marginTokens: prompt.marginTokens,
         allowanceTokens: prompt.allowanceTokens,
         manuscriptTokens: blockFor(prompt, 'MANUSCRIPT')?.tokens ?? null,
@@ -1480,10 +2236,14 @@ function figuresFromPrompt(prompt) {
  */
 function figuresFromBudget(budget) {
     return {
+        action: budget.action ?? null,
         contextTokens: budget.contextTokens,
         reserveTokens: budget.reserveTokens,
+        authorReserveTokens: budget.authorReserveTokens ?? null,
         reserveSource: budget.reserveSource,
         framingTokens: budget.framingTokens,
+        profileTokens: budget.profileTokens ?? null,
+        selectionTokens: budget.selectionTokens ?? null,
         marginTokens: budget.marginTokens,
         allowanceTokens: budget.allowanceTokens,
         manuscriptTokens: null,
@@ -1504,7 +2264,7 @@ function figuresFromBudget(budget) {
  * applied. Reading blocks[].content instead is the easiest mistake to make in
  * this file and would show a prompt the model never received.
  *
- * @param {object} prompt a buildContinuePrompt() result
+ * @param {object} prompt a buildPrompt() result
  * @param {{chapterId: string, generation: number}} target
  * @param {string} source the manuscript the prompt was built from
  * @param {'built'|'sent'} origin
@@ -1512,7 +2272,11 @@ function figuresFromBudget(budget) {
 function captureInspection(prompt, target, source, origin) {
     inspection = {
         origin,
+        action: prompt.action,
         source,
+        // What the profile rendered to at capture time — a string, compared
+        // as a string, so staleness never re-counts anything.
+        profileSource: prompt.profileText ?? '',
         chapterId: target.chapterId,
         generation: target.generation,
         messages: expandForDisplay(prompt.messages).map((message, index) => {
@@ -1526,9 +2290,6 @@ function captureInspection(prompt, target, source, origin) {
                 failed: message.failed,
                 text: message.content,
                 reason: block?.reason ?? '',
-                // MANUSCRIPT is the only block carrying its own count. A blank
-                // would read as "unknown" and a zero as "free", so the other two
-                // say where their tokens actually went.
                 tokenLabel: typeof block?.tokens === 'number'
                     ? `${block.tokens.toLocaleString()} tokens`
                     : 'counted with the framing',
@@ -1574,7 +2335,9 @@ function refusalInspection(panel, error, target, source) {
 
     inspection = {
         origin: 'built',
+        action: budget?.action ?? target.action ?? 'continue',
         source,
+        profileSource: null,
         chapterId: target.chapterId,
         generation: target.generation,
         messages: [],
@@ -1609,6 +2372,7 @@ function refusalInspection(panel, error, target, source) {
  */
 function markInspectionSent(target) {
     if (inspection
+        && inspection.action === target.action
         && inspection.chapterId === target.chapterId
         && inspection.generation === target.generation) {
         inspection.origin = 'sent';
@@ -1632,6 +2396,7 @@ async function buildInspection(panel) {
     }
 
     const target = {
+        action: 'continue',
         chapterId: workspace.chapter.id,
         // Captured at the trigger, like every other long action in this file.
         generation: getWorkspaceGeneration(),
@@ -1647,7 +2412,7 @@ async function buildInspection(panel) {
     renderInspection(panel);
 
     try {
-        const prompt = await buildContinuePrompt(source);
+        const prompt = await buildContinuePrompt(source, { profile: readProfileForm(panel) });
 
         // Token counting is async and can round-trip to the server, so the
         // workspace may have moved while it ran. Painting chapter A's prompt
@@ -1684,9 +2449,9 @@ function renderInspectorControls(panel) {
     const copy = panel.querySelector('.sillynovel-inspector-copy');
 
     if (refresh) {
-        // Disabled while a Continue is measuring: that path hands this region
+        // Disabled while an action is measuring: that path hands this region
         // its capture for free, so refreshing now would pay for the same counts
-        // twice. Re-enabled from startContinue's finally.
+        // twice. Re-enabled when action measurement finishes.
         refresh.disabled = inspecting || building;
     }
 
@@ -1708,7 +2473,28 @@ function renderInspectorStale(panel) {
     // ⚠️ A STRING COMPARISON against the snapshot, never a re-measure. This
     // runs on every keystroke, and token counting must not run in the typing
     // path (ARCHITECTURE.md:165-166). Do not "improve" this into a rebuild.
-    stale.hidden = !inspection || !editor || editor.value === inspection.source;
+    const profileUnchanged = inspection?.profileSource === null
+        || renderProfileText(readProfileForm(panel)) === inspection?.profileSource;
+    const chapterChanged = Boolean(inspection && editor) && editor.value !== inspection.source;
+    const profileChanged = Boolean(inspection) && !profileUnchanged;
+
+    stale.hidden = !inspection || !editor || (!chapterChanged && !profileChanged);
+
+    if (stale.hidden) {
+        return;
+    }
+
+    // Name what moved: blaming the chapter for a profile edit sends the author
+    // looking for a change that is not there.
+    let what = 'The chapter';
+
+    if (chapterChanged && profileChanged) {
+        what = 'The chapter and the Writing Profile';
+    } else if (profileChanged) {
+        what = 'The Writing Profile';
+    }
+
+    stale.textContent = `${what} changed after this was built, so it is no longer the prompt this action would send. Refresh to rebuild.`;
 }
 
 /** @param {HTMLElement} panel */
@@ -1724,8 +2510,10 @@ function renderInspectorNote(panel) {
         return;
     }
 
+    const label = ACTIONS[inspection.action]?.label ?? 'action';
+
     note.textContent = `${INSPECTOR_NOTE} ${inspection.origin === 'sent'
-        ? 'This is the prompt that was assembled and sent for the last Continue.'
+        ? `This is the prompt that was assembled and sent for the last ${label}.`
         : 'Built from the editor. Nothing was sent.'}`;
 }
 
@@ -1776,9 +2564,14 @@ function renderInspectorFigures(panel) {
         : tokenFigure(figures.manuscriptTokens);
 
     const rows = [
+        ['Action', ACTIONS[figures.action]?.label ?? 'not reached — the refusal came first'],
         ['Context size', tokenFigure(figures.contextTokens)],
-        ['Reply reserve', `${tokenFigure(figures.reserveTokens)} · ${RESERVE_SOURCE_LABEL[figures.reserveSource] ?? 'source unknown'}`],
+        ['Reply reserve', reserveFigure(figures)],
         ['Framing', tokenFigure(figures.framingTokens)],
+        ['Writing Profile', figures.profileTokens === 0 ? 'empty — not sent' : tokenFigure(figures.profileTokens)],
+        ['Selection', figures.selectionTokens === 0
+            ? 'none — this action takes no selection'
+            : tokenFigure(figures.selectionTokens)],
         ['Safety margin', tokenFigure(figures.marginTokens)],
         ['Room left for the manuscript', tokenFigure(figures.allowanceTokens)],
         ['Manuscript sent', manuscript],
@@ -1939,9 +2732,10 @@ function inspectionTranscript() {
         return '';
     }
 
+    const label = ACTIONS[inspection.action]?.label ?? 'action';
     const lines = [
         inspection.origin === 'sent'
-            ? 'SillyNovel — the prompt assembled and sent for the last Continue'
+            ? `SillyNovel — the prompt assembled and sent for the last ${label}`
             : 'SillyNovel — prompt built from the editor; nothing was sent',
         '',
     ];
@@ -2029,6 +2823,287 @@ function wireInspector(panel) {
     renderInspection(panel);
 }
 
+/* --- the Writing Profile (Phase 3 checkpoint 2) --------------------------
+
+   Explicit Save, no idle debounce: the profile is short, edited rarely, and
+   its loss window is "typed but not yet Saved at a crash", which the dirty
+   indicator shows the author the whole time. The recovery module is
+   chapter-keyed with offer/halt semantics that would have to be duplicated
+   for a second document kind — machinery the manuscript earns and this does
+   not. Leave-flushes (close, tab hidden, Ctrl-S inside the region) cover the
+   ordinary ways an edit is abandoned. */
+
+const PROFILE_CONFLICT_MESSAGE = 'The Writing Profile was changed somewhere else since you opened it, so your '
+    + 'edits were not saved. Copy anything you want to keep, then press Reload profile to see the '
+    + 'current version — reloading replaces what is in these fields.';
+
+const PROFILE_TOO_LARGE_MESSAGE = 'This profile is too large to save. Shorten the longest fields — 8 KB each, '
+    + '32 KB for prose examples.';
+
+/** True while a profile save is in flight. Never gates writing actions. */
+let profileSaving = false;
+
+/** @param {HTMLElement} panel */
+function profileFieldsOf(panel) {
+    return [...panel.querySelectorAll('.sillynovel-profile-field')];
+}
+
+/**
+ * The profile as the FORM holds it — what is sent, and what is saved.
+ *
+ * Starts from the saved object so unknown keys a newer client wrote survive
+ * the round trip on this side too; the server preserves them regardless.
+ *
+ * @param {HTMLElement} panel
+ */
+function readProfileForm(panel) {
+    const form = { ...(getProfile()?.data ?? {}) };
+
+    for (const field of profileFieldsOf(panel)) {
+        form[field.dataset.field] = field.value;
+    }
+
+    return form;
+}
+
+/** @param {HTMLElement} panel */
+function isProfileDirty(panel) {
+    const saved = getProfile()?.data ?? {};
+
+    // A non-string from a hand-edited file compares as '' and is written back
+    // as '' on the next save — the form cannot hold anything else.
+    return profileFieldsOf(panel).some((field) => field.value !== String(saved[field.dataset.field] ?? ''));
+}
+
+/**
+ * Paint the textareas from the SAVED profile. Called after resolve, after
+ * Reload, and on Discard — never from renderWorkspaceContent, so a chapter
+ * switch cannot clobber unsaved edits in a project-scoped document.
+ *
+ * @param {HTMLElement} panel
+ */
+function renderProfileForm(panel) {
+    const saved = getProfile()?.data ?? {};
+
+    for (const field of profileFieldsOf(panel)) {
+        field.value = String(saved[field.dataset.field] ?? '');
+    }
+
+    renderProfileStatus(panel);
+}
+
+/**
+ * @param {HTMLElement} panel
+ * @param {string} state
+ * @param {string} text
+ */
+function setProfileStatus(panel, state, text) {
+    const status = panel.querySelector('.sillynovel-profile-status');
+
+    if (status) {
+        status.dataset.state = state;
+        status.textContent = text;
+    }
+}
+
+/** @param {HTMLElement} panel */
+function renderProfileStatus(panel) {
+    const save = panel.querySelector('.sillynovel-profile-save');
+    const discard = panel.querySelector('.sillynovel-profile-discard');
+    const reload = panel.querySelector('.sillynovel-profile-reload');
+    const halt = getProfileHalt();
+    const dirty = isProfileDirty(panel);
+
+    if (save) {
+        save.disabled = profileSaving || halt !== null || !dirty;
+    }
+    if (discard) {
+        discard.disabled = profileSaving || !dirty;
+    }
+    if (reload) {
+        reload.hidden = halt === null;
+    }
+
+    if (halt === 'conflict') {
+        setProfileStatus(panel, 'conflict', PROFILE_CONFLICT_MESSAGE);
+    } else if (profileSaving) {
+        setProfileStatus(panel, 'saving', 'Saving…');
+    } else if (dirty) {
+        setProfileStatus(panel, 'dirty', 'Unsaved changes — press Save profile.');
+    } else {
+        setProfileStatus(panel, 'idle', getProfile() ? 'Saved on the server.' : '');
+    }
+}
+
+/** @param {HTMLElement} panel */
+function handleProfileChange(panel) {
+    renderProfileStatus(panel);
+    // The prompt is built from the form, so an edited profile makes a displayed
+    // prompt stale exactly as an edited chapter does.
+    renderInspectorStale(panel);
+}
+
+/**
+ * Save the profile now. Returns 'clean', 'dirty' or 'failed', like autoSave.
+ *
+ * @param {HTMLElement} panel
+ */
+async function saveProfileNow(panel) {
+    if (profileSaving || getProfileHalt() !== null || !isProfileDirty(panel)) {
+        return 'clean';
+    }
+
+    const data = readProfileForm(panel);
+    let outcome = 'failed';
+    let failure = null;
+
+    profileSaving = true;
+    renderProfileStatus(panel);
+
+    try {
+        const result = await saveProfile(data);
+
+        if (result !== null) {
+            outcome = panel.isConnected && isProfileDirty(panel) ? 'dirty' : 'clean';
+        }
+    } catch (error) {
+        failure = error;
+    } finally {
+        profileSaving = false;
+
+        // Live, not captured: after a close and reopen the captured panel is
+        // detached and the REOPENED one is the one holding a disabled button.
+        const live = document.getElementById('sillynovel-panel');
+
+        if (live) {
+            renderProfileStatus(live);
+
+            // A conflict is rendered by the halt above; anything else is a
+            // message that stands until the next edit repaints it.
+            if (failure && getProfileHalt() === null) {
+                setProfileStatus(live, 'error', failure?.status === 413
+                    ? PROFILE_TOO_LARGE_MESSAGE
+                    : (failure?.message ?? 'The profile could not be saved.'));
+            }
+        }
+    }
+
+    return outcome;
+}
+
+/**
+ * Fire-and-forget save of a dirty profile as the author leaves. The result is
+ * discarded by session.js's generation guard where the workspace has moved on;
+ * what matters is that the bytes reach the server.
+ *
+ * @param {HTMLElement} panel
+ */
+function flushProfile(panel) {
+    if (profileSaving || getProfileHalt() !== null || !isProfileDirty(panel)) {
+        return;
+    }
+
+    void saveProfile(readProfileForm(panel)).catch(() => {
+        // Nothing left to tell.
+    });
+}
+
+/** @param {HTMLElement} panel */
+async function reloadProfileNow(panel) {
+    try {
+        await reloadProfile();
+    } catch (error) {
+        if (panel.isConnected) {
+            setProfileStatus(panel, 'error', error?.message ?? 'The profile could not be reloaded.');
+        }
+        return;
+    }
+
+    const live = document.getElementById('sillynovel-panel');
+
+    if (live) {
+        renderProfileForm(live);
+        renderInspectorStale(live);
+    }
+}
+
+/**
+ * Wire the region's controls. Called once per mount, like wireInspector.
+ *
+ * @param {HTMLElement} panel
+ */
+function wireProfile(panel) {
+    const toggle = panel.querySelector('.sillynovel-profile-toggle');
+    const body = panel.querySelector('.sillynovel-profile-body');
+
+    if (toggle && body) {
+        // Set explicitly rather than relying on the template's `hidden`
+        // surviving DOMPurify, so "collapsed by default" is our guarantee.
+        body.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+
+        toggle.onclick = () => {
+            const open = toggle.getAttribute('aria-expanded') === 'true';
+            toggle.setAttribute('aria-expanded', String(!open));
+            body.hidden = open;
+        };
+    }
+
+    for (const field of profileFieldsOf(panel)) {
+        field.addEventListener('input', () => { handleProfileChange(panel); });
+    }
+
+    const save = panel.querySelector('.sillynovel-profile-save');
+    const discard = panel.querySelector('.sillynovel-profile-discard');
+    const reload = panel.querySelector('.sillynovel-profile-reload');
+
+    if (save) {
+        save.onclick = () => { void saveProfileNow(panel); };
+    }
+    if (discard) {
+        discard.onclick = () => {
+            renderProfileForm(panel);
+            renderInspectorStale(panel);
+        };
+    }
+    if (reload) {
+        reload.onclick = () => { void reloadProfileNow(panel); };
+    }
+}
+
+/**
+ * Wire the notes region. Called once per mount, like wireEditor.
+ *
+ * The disclosure state is NOT reset on a chapter switch — renderWorkspaceContent
+ * repaints the text and never touches `hidden`, so an author who keeps notes
+ * open keeps them open, as with the Inspector.
+ *
+ * @param {HTMLElement} panel
+ */
+function wireNotes(panel) {
+    const toggle = panel.querySelector('.sillynovel-notes-toggle');
+    const body = panel.querySelector('.sillynovel-notes-body');
+    const editor = notesEditorOf(panel);
+
+    if (toggle && body) {
+        // Set explicitly rather than relying on the template's `hidden`
+        // surviving DOMPurify, so "collapsed by default" is our guarantee.
+        body.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+
+        toggle.onclick = () => {
+            const open = toggle.getAttribute('aria-expanded') === 'true';
+            toggle.setAttribute('aria-expanded', String(!open));
+            body.hidden = open;
+        };
+    }
+
+    if (editor) {
+        editor.addEventListener('input', () => { handleNotesChange(panel); });
+        editor.addEventListener('blur', () => { void notesSaver.autoSave(panel); });
+    }
+}
+
 /**
  * Attach the editor's save triggers. Called once per mount.
  *
@@ -2044,7 +3119,17 @@ function wireEditor(panel) {
         return;
     }
 
-    editor.addEventListener('input', () => { handleEditorChange(panel); });
+    // Located BEFORE the edit lands, while the selection still describes it.
+    editor.addEventListener('beforeinput', (event) => {
+        pendingEditStart = editStartFor(event, editor);
+    });
+
+    editor.addEventListener('input', () => {
+        // An input with no beforeinput ahead of it cannot be located: 0 breaks every anchor.
+        pendingEditStart ??= 0;
+        applyPendingEdit();
+        handleEditorChange(panel);
+    });
 
     editor.addEventListener('blur', () => {
         void autoSave(panel);
@@ -2058,6 +3143,21 @@ function wireEditor(panel) {
         }
 
         event.preventDefault();
+
+        // The document under the cursor: a shortcut pressed inside the profile
+        // saves the profile, and never the chapter it happens to share a panel
+        // with.
+        if (event.target instanceof Element && event.target.closest('.sillynovel-profile')) {
+            void saveProfileNow(panel);
+            return;
+        }
+
+        // Before the offer check: the offer belongs to the chapter, and a
+        // shortcut pressed inside the notes must not be diverted to its banner.
+        if (event.target instanceof Element && event.target.closest('.sillynovel-notes')) {
+            void notesSaver.autoSave(panel);
+            return;
+        }
 
         // Under the halt predicate this would silently no-op, and a writer who
         // presses it believes they have saved. Say what is needed instead — but
@@ -2077,8 +3177,17 @@ function wireEditor(panel) {
     panel.querySelector('.sillynovel-recovery-discard')
         ?.addEventListener('click', () => { void discardRecoveredDraft(panel); });
 
-    panel.querySelector('.sillynovel-continue')
-        ?.addEventListener('click', () => { void startContinue(panel); });
+    panel.querySelector('.sillynovel-actions')
+        ?.addEventListener('click', (event) => {
+            const button = event.target instanceof Element
+                ? event.target.closest('.sillynovel-action')
+                : null;
+            const action = button?.dataset.action;
+
+            if (action) {
+                void startAction(panel, action);
+            }
+        });
     panel.querySelector('.sillynovel-cancel')
         ?.addEventListener('click', () => { cancelGeneration(); });
 
@@ -2090,7 +3199,16 @@ function wireEditor(panel) {
             hidePreflight(panel);
 
             if (confirmed) {
-                void runGeneration(panel, confirmed.prompt, confirmed.target);
+                if (actionSnapshotIsCurrent(panel, confirmed.target)) {
+                    void runGeneration(panel, confirmed.prompt, confirmed.target);
+                } else {
+                    setActionNote(
+                        panel,
+                        'error',
+                        'The chapter or Writing Profile changed while confirmation was open. Run the action again.',
+                    );
+                    renderActionBar(panel);
+                }
             }
         });
 
@@ -2102,18 +3220,37 @@ function wireEditor(panel) {
             renderActionBar(panel);
         });
 
-    panel.querySelector('.sillynovel-insert')
-        ?.addEventListener('click', () => { insertSuggestion(panel); });
-    panel.querySelector('.sillynovel-copy')
-        ?.addEventListener('click', () => { void copySuggestion(panel); });
-    panel.querySelector('.sillynovel-discard')
-        ?.addEventListener('click', () => {
-            // Declining leaves the draft BYTE-IDENTICAL (PLAN.md:386) — this
-            // touches the pane and nothing else.
-            suggestion = null;
-            setSuggestionStatus(panel, null);
-            renderSuggestion(panel);
+    panel.querySelector('.sillynovel-suggestion-actions')
+        ?.addEventListener('click', (event) => {
+            const button = event.target instanceof Element
+                ? event.target.closest('.sillynovel-suggestion-action')
+                : null;
+
+            switch (button?.dataset.act) {
+                case 'insert':
+                    insertSuggestion(panel);
+                    break;
+                case 'replace':
+                    replaceSelection(panel);
+                    break;
+                case 'add-to-notes':
+                    addSuggestionToNotes(panel);
+                    break;
+                case 'copy':
+                    void copySuggestion(panel);
+                    break;
+                case 'discard':
+                    discardSuggestion(panel);
+                    break;
+                default:
+                    break;
+            }
         });
+
+    panel.querySelector('.sillynovel-history-previous')
+        ?.addEventListener('click', () => { moveSuggestionHistory(panel, -1); });
+    panel.querySelector('.sillynovel-history-next')
+        ?.addEventListener('click', () => { moveSuggestionHistory(panel, 1); });
 }
 
 /**
@@ -2132,6 +3269,8 @@ document.addEventListener('visibilitychange', () => {
 
     if (panel) {
         void autoSave(panel);
+        void notesSaver.autoSave(panel);
+        flushProfile(panel);
     }
 });
 
@@ -2154,12 +3293,16 @@ export function flushOnClose() {
         return;
     }
 
-    // ⚠️ The rendered suggestion is view state and goes with the panel. An
-    // in-flight GENERATION deliberately does not: closing does not cancel it
-    // (stopGeneration is global), so generate.js keeps it and a reopened panel
-    // shows it running, with Cancel. Clearing it here is what would put a live
-    // Continue button over a request the author is still paying for.
+    // Suggestions are panel-session state. The in-flight generation remains in
+    // generate.js so a reopened panel cannot start a second paid request.
     suggestion = null;
+    suggestionHistory.clear();
+    // The anchors belong to that history and to a mounted editor; both go.
+    selectionAnchors.clear();
+    pendingEditStart = null;
+    editorChapterId = null;
+    lastSeenText.clear();
+    arrivedWhileClosed = null;
     pendingPreflight = null;
     // The rendered prompt is view state too, and it holds a copy of the
     // manuscript. It goes when the panel goes.
@@ -2171,13 +3314,13 @@ export function flushOnClose() {
     // offer is pending.
     recordDraft(editorOf(panel)?.value ?? '');
 
-    if (getHalt() !== null || !isDirty(panel)) {
-        return;
-    }
+    // The profile has its own halt and its own dirtiness; a chapter's halt
+    // must not stop it from reaching the server.
+    flushProfile(panel);
 
-    void saveChapter(editorOf(panel).value).catch(() => {
-        // Nothing left to tell: the panel is going away.
-    });
+    chapterSaver.flushOnClose(panel);
+    // No recordDraft on this path: notes have no recovery copy by design.
+    notesSaver.flushOnClose(panel);
 }
 
 /**
@@ -2201,7 +3344,10 @@ export async function renderWorkspace(panel) {
         }
 
         wireInspector(panel);
+        wireProfile(panel);
+        renderProfileForm(panel);
         wireEditor(panel);
+        wireNotes(panel);
 
         const newChapter = panel.querySelector('.sillynovel-new-chapter');
         if (newChapter) {

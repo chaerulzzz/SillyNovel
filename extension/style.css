@@ -241,9 +241,10 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-workspace-ready {
     display: grid;
     grid-template-columns: minmax(140px, 200px) minmax(0, 1fr) minmax(160px, 240px);
-    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) auto auto;
     grid-template-areas:
         "nav editor suggestions"
+        "profile profile profile"
         "inspector inspector inspector";
     gap: 12px;
     height: 100%;
@@ -260,8 +261,9 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
             "nav"
             "editor"
             "suggestions"
+            "profile"
             "inspector";
-        grid-template-rows: auto minmax(160px, 1fr) auto auto;
+        grid-template-rows: auto minmax(160px, 1fr) auto auto auto;
         overflow-y: auto;
     }
 
@@ -307,6 +309,8 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-chapter-entry,
 .sillynovel-new-chapter,
 .sillynovel-inspector-toggle,
+.sillynovel-profile-toggle,
+.sillynovel-notes-toggle,
 .sillynovel-inline-retry {
     background: none;
     border: 1px solid transparent;
@@ -323,9 +327,13 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-chapter-entry:hover,
 .sillynovel-new-chapter:hover,
 .sillynovel-inspector-toggle:hover,
+.sillynovel-profile-toggle:hover,
+.sillynovel-notes-toggle:hover,
 .sillynovel-chapter-entry:focus-visible,
 .sillynovel-new-chapter:focus-visible,
-.sillynovel-inspector-toggle:focus-visible {
+.sillynovel-inspector-toggle:focus-visible,
+.sillynovel-profile-toggle:focus-visible,
+.sillynovel-notes-toggle:focus-visible {
     background-color: var(--white20a);
 }
 
@@ -427,6 +435,90 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 .sillynovel-suggestions-empty {
     opacity: 0.7;
     font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+/* --- writing profile (Phase 3) --- */
+
+.sillynovel-profile {
+    grid-area: profile;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    padding-top: 8px;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+/* Declared after the base rule for the same reason as the inspector's. */
+@media (max-width: 1000px) {
+    .sillynovel-profile {
+        max-height: none;
+        overflow-y: visible;
+    }
+}
+
+.sillynovel-profile-toggle {
+    border-color: var(--SmartThemeBorderColor);
+    width: auto;
+}
+
+.sillynovel-profile-body {
+    padding-top: 8px;
+}
+
+.sillynovel-profile-note {
+    margin: 0 0 8px;
+    opacity: 0.7;
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+.sillynovel-profile-fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.sillynovel-profile-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.85;
+}
+
+.sillynovel-profile-label-wide {
+    grid-column: 1 / -1;
+}
+
+.sillynovel-profile-field {
+    resize: vertical;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background-color: var(--black30a);
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    line-height: 1.5;
+    opacity: 1;
+}
+
+.sillynovel-profile-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.sillynovel-profile-status {
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.75;
+}
+
+.sillynovel-profile-status[data-state="dirty"],
+.sillynovel-profile-status[data-state="error"],
+.sillynovel-profile-status[data-state="conflict"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
 }
 
 /* --- context inspector --- */
@@ -637,11 +729,61 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
 
 /* A conflict is the one status the author must actually read: their words are
    unsaved and will not save until they act. Everything else is ambient. */
-.sillynovel-save-status[data-state="conflict"] {
+.sillynovel-save-status[data-state="conflict"],
+.sillynovel-notes-status[data-state="conflict"] {
     opacity: 1;
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 5px;
     padding: 6px 8px;
+}
+
+/* --- per-chapter notes (Phase 3) --- */
+
+/* Pinned like the recovery banner: never a flex competitor to the editor's
+   1 1 auto, and the textarea's own height is bounded, so the worst case on a
+   short panel is the editor at its 120px floor and the panel body scrolling. */
+.sillynovel-notes {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    padding-top: 8px;
+}
+
+.sillynovel-notes-toggle {
+    border-color: var(--SmartThemeBorderColor);
+    width: auto;
+}
+
+.sillynovel-notes-body {
+    display: flex;
+    flex-direction: column;
+    padding-top: 8px;
+}
+
+.sillynovel-notes-editor {
+    min-height: 80px;
+    max-height: 30vh;
+    resize: vertical;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background-color: var(--black30a);
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    line-height: 1.5;
+}
+
+.sillynovel-notes-status {
+    margin: 4px 0 0;
+    min-height: 1.4em;
+    font-size: calc(var(--mainFontSize) * 0.9);
+    opacity: 0.7;
+}
+
+.sillynovel-notes-status[data-state="dirty"],
+.sillynovel-notes-status[data-state="error"] {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, inherit);
 }
 
 .sillynovel-save-status[data-state="saving"],
@@ -694,7 +836,7 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     background-color: var(--white30a);
 }
 
-/* --- Continue, preflight, suggestions (checkpoint 8) --------------------- */
+/* --- Writing actions, preflight and suggestions -------------------------- */
 
 .sillynovel-actions {
     flex: 0 0 auto;
@@ -704,15 +846,16 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     gap: 8px;
 }
 
-.sillynovel-continue,
+.sillynovel-action,
 .sillynovel-cancel,
 .sillynovel-preflight-confirm,
 .sillynovel-preflight-cancel,
-.sillynovel-insert,
-.sillynovel-copy,
-.sillynovel-discard,
+.sillynovel-suggestion-action,
 .sillynovel-inspector-refresh,
-.sillynovel-inspector-copy {
+.sillynovel-inspector-copy,
+.sillynovel-profile-save,
+.sillynovel-profile-discard,
+.sillynovel-profile-reload {
     width: auto;
     background: none;
     border: 1px solid var(--SmartThemeBorderColor);
@@ -724,31 +867,35 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     cursor: pointer;
 }
 
-.sillynovel-continue:hover,
+.sillynovel-action:hover,
 .sillynovel-cancel:hover,
 .sillynovel-preflight-confirm:hover,
 .sillynovel-preflight-cancel:hover,
-.sillynovel-insert:hover,
-.sillynovel-copy:hover,
-.sillynovel-discard:hover,
+.sillynovel-suggestion-action:hover,
 .sillynovel-inspector-refresh:hover,
 .sillynovel-inspector-copy:hover,
+.sillynovel-profile-save:hover,
+.sillynovel-profile-discard:hover,
+.sillynovel-profile-reload:hover,
 .sillynovel-inspector-refresh:focus-visible,
 .sillynovel-inspector-copy:focus-visible,
-.sillynovel-continue:focus-visible,
+.sillynovel-profile-save:focus-visible,
+.sillynovel-profile-discard:focus-visible,
+.sillynovel-profile-reload:focus-visible,
+.sillynovel-action:focus-visible,
 .sillynovel-cancel:focus-visible,
 .sillynovel-preflight-confirm:focus-visible,
 .sillynovel-preflight-cancel:focus-visible,
-.sillynovel-insert:focus-visible,
-.sillynovel-copy:focus-visible,
-.sillynovel-discard:focus-visible {
+.sillynovel-suggestion-action:focus-visible {
     background-color: var(--white30a);
 }
 
-.sillynovel-continue:disabled,
-.sillynovel-insert:disabled,
+.sillynovel-action:disabled,
+.sillynovel-suggestion-action:disabled,
 .sillynovel-inspector-refresh:disabled,
-.sillynovel-inspector-copy:disabled {
+.sillynovel-inspector-copy:disabled,
+.sillynovel-profile-save:disabled,
+.sillynovel-profile-discard:disabled {
     opacity: 0.5;
     cursor: default;
 }
@@ -787,7 +934,8 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     gap: 8px;
 }
 
-.sillynovel-suggestions-status[data-state="error"] {
+.sillynovel-suggestions-status[data-state="error"],
+.sillynovel-suggestions-status[data-state="warning"] {
     color: var(--SmartThemeQuoteColor, inherit);
 }
 
@@ -808,6 +956,69 @@ body.sillynovel-panel-open.sillynovel-panel-maximized #character_popup {
     border: 1px solid var(--SmartThemeBorderColor);
     border-radius: 8px;
     background-color: var(--black30a);
+}
+
+.sillynovel-suggestion-original-block,
+.sillynovel-suggestion-proposed-block {
+    margin-bottom: 10px;
+}
+
+.sillynovel-suggestion-original-block h6,
+.sillynovel-suggestion-proposed-block h6 {
+    margin: 0 0 4px;
+    font-size: calc(var(--mainFontSize) * 0.85);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+}
+
+.sillynovel-suggestion-original {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.6;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    opacity: 0.65;
+}
+
+.sillynovel-suggestion-history {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.sillynovel-history-previous,
+.sillynovel-history-next {
+    width: auto;
+    background: none;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 3px 8px;
+    color: inherit;
+    font-family: inherit;
+    font-size: calc(var(--mainFontSize) * 0.85);
+    cursor: pointer;
+}
+
+.sillynovel-history-previous:disabled,
+.sillynovel-history-next:disabled {
+    cursor: default;
+    opacity: 0.45;
+}
+
+.sillynovel-history-previous:not(:disabled):hover,
+.sillynovel-history-next:not(:disabled):hover,
+.sillynovel-history-previous:focus-visible,
+.sillynovel-history-next:focus-visible {
+    background-color: var(--white30a);
+}
+
+.sillynovel-history-position {
+    font-size: calc(var(--mainFontSize) * 0.85);
+    opacity: 0.7;
 }
 
 .sillynovel-suggestion-actions {

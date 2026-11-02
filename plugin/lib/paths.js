@@ -214,12 +214,49 @@ export async function ensureRealDirectory(target) {
     const stats = await fs.lstat(target).catch(() => null);
 
     if (!stats) {
-        await fs.mkdir(target);
-        return;
+        try {
+            await fs.mkdir(target);
+            return;
+        } catch (error) {
+            // Two writers racing to create the same per-resource directory —
+            // e.g. two chapters' first notes saves in one project — both see it
+            // absent and both mkdir. The loser must not fail the request: it
+            // re-checks what now exists with the same test as the found path.
+            if (error?.code !== 'EEXIST') {
+                throw error;
+            }
+        }
+    }
+
+    const found = stats ?? await fs.lstat(target).catch(() => null);
+
+    if (!found || found.isSymbolicLink() || !found.isDirectory()) {
+        throw new RequestError(404, 'not found');
+    }
+}
+
+/**
+ * Probe a PER-RESOURCE directory on a READ path.
+ *
+ * Absent is a legitimate answer here ("nothing stored yet"), so it returns
+ * false rather than throwing; a symlink or a non-directory is 404 like any
+ * tampered resource; a real directory is true. Never creates — a read must not
+ * write — which is why neither ensureRealDirectory (creates) nor
+ * assertRealDirectory (404 on absent) fits.
+ *
+ * @param {string} target
+ * @returns {Promise<boolean>}
+ */
+export async function probeRealDirectory(target) {
+    const stats = await fs.lstat(target).catch(() => null);
+
+    if (!stats) {
+        return false;
     }
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
         throw new RequestError(404, 'not found');
     }
+    return true;
 }
 
 /**

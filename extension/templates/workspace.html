@@ -40,13 +40,12 @@
             <textarea class="sillynovel-editor" spellcheck="false"></textarea>
             <p class="sillynovel-save-status" role="status"></p>
 
-            <!--
-                Continue (checkpoint 8). One model request at a time: the button
-                is replaced by Cancel while one runs, including while the author
-                is looking at a different chapter.
-            -->
             <div class="sillynovel-actions">
-                <button type="button" class="sillynovel-continue">Continue</button>
+                <button type="button" class="sillynovel-action" data-action="continue">Continue</button>
+                <button type="button" class="sillynovel-action" data-action="rewrite">Rewrite selection</button>
+                <button type="button" class="sillynovel-action" data-action="expand">Expand selection</button>
+                <button type="button" class="sillynovel-action" data-action="summarize">Summarize</button>
+                <button type="button" class="sillynovel-action" data-action="brainstorm">Brainstorm</button>
                 <button type="button" class="sillynovel-cancel" hidden>Cancel</button>
                 <span class="sillynovel-action-note" role="status"></span>
             </div>
@@ -65,6 +64,19 @@
                     <button type="button" class="sillynovel-preflight-cancel">Not now</button>
                 </div>
             </div>
+
+            <!--
+                Per-chapter notes (Phase 3). The status line sits OUTSIDE the
+                collapsible body: a conflict can land after the author collapses
+                the region, and it has to stay visible.
+            -->
+            <section class="sillynovel-notes" aria-label="Notes for this chapter">
+                <button type="button" class="sillynovel-notes-toggle" aria-expanded="false">Notes for this chapter</button>
+                <div class="sillynovel-notes-body" hidden>
+                    <textarea class="sillynovel-notes-editor" rows="6" spellcheck="false" aria-label="Notes for this chapter"></textarea>
+                </div>
+                <p class="sillynovel-notes-status" role="status"></p>
+            </section>
         </div>
 
         <aside class="sillynovel-suggestions" aria-label="Suggestions">
@@ -74,14 +86,44 @@
 
             <div class="sillynovel-suggestion" hidden>
                 <p class="sillynovel-suggestion-stale" hidden>The chapter changed after this was generated, so it may no longer follow on.</p>
-                <div class="sillynovel-suggestion-text"></div>
-                <div class="sillynovel-suggestion-actions">
-                    <button type="button" class="sillynovel-insert">Insert</button>
-                    <button type="button" class="sillynovel-copy">Copy</button>
-                    <button type="button" class="sillynovel-discard">Discard</button>
+                <div class="sillynovel-suggestion-history" hidden>
+                    <button type="button" class="sillynovel-history-previous">‹ Previous</button>
+                    <span class="sillynovel-history-position"></span>
+                    <button type="button" class="sillynovel-history-next">Next ›</button>
                 </div>
+                <div class="sillynovel-suggestion-original-block" hidden>
+                    <h6>Original</h6>
+                    <div class="sillynovel-suggestion-original"></div>
+                </div>
+                <div class="sillynovel-suggestion-proposed-block">
+                    <h6 class="sillynovel-suggestion-proposed-label" hidden>Proposed</h6>
+                    <div class="sillynovel-suggestion-text"></div>
+                </div>
+                <div class="sillynovel-suggestion-actions"></div>
             </div>
         </aside>
+
+        <section class="sillynovel-profile" aria-label="Writing Profile">
+            <button type="button" class="sillynovel-profile-toggle" aria-expanded="false">Writing Profile</button>
+            <div class="sillynovel-profile-body" hidden>
+                <p class="sillynovel-profile-note">How the prose should read. Sent first with every request and never trimmed. Stored with the project on the server.</p>
+                <div class="sillynovel-profile-fields">
+                    <label class="sillynovel-profile-label">Voice<textarea class="sillynovel-profile-field" data-field="voice" rows="2" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Genre<textarea class="sillynovel-profile-field" data-field="genre" rows="1" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Point of view<textarea class="sillynovel-profile-field" data-field="pov" rows="1" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Tense<textarea class="sillynovel-profile-field" data-field="tense" rows="1" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Style instructions<textarea class="sillynovel-profile-field" data-field="styleInstructions" rows="4" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label sillynovel-profile-label-wide">Prose examples<textarea class="sillynovel-profile-field" data-field="proseExamples" rows="8" spellcheck="false"></textarea></label>
+                    <label class="sillynovel-profile-label">Boundaries<textarea class="sillynovel-profile-field" data-field="boundaries" rows="3" spellcheck="false"></textarea></label>
+                </div>
+                <div class="sillynovel-profile-actions">
+                    <button type="button" class="sillynovel-profile-save" disabled>Save profile</button>
+                    <button type="button" class="sillynovel-profile-discard" disabled>Discard changes</button>
+                    <button type="button" class="sillynovel-profile-reload" hidden>Reload profile</button>
+                    <span class="sillynovel-profile-status" role="status"></span>
+                </div>
+            </div>
+        </section>
 
         <section class="sillynovel-inspector" aria-label="Context Inspector">
             <button type="button" class="sillynovel-inspector-toggle" aria-expanded="false">Context Inspector</button>
@@ -92,7 +134,7 @@
                     <button type="button" class="sillynovel-inspector-copy">Copy prompt</button>
                     <span class="sillynovel-inspector-status" role="status" hidden></span>
                 </div>
-                <p class="sillynovel-inspector-stale" hidden>The chapter changed after this was built, so it is no longer the prompt Continue would send. Refresh to rebuild.</p>
+                <p class="sillynovel-inspector-stale" hidden>The chapter changed after this was built, so it is no longer the prompt this action would send. Refresh to rebuild.</p>
                 <p class="sillynovel-inspector-empty">Nothing built yet. Refresh builds the prompt from what the editor holds right now, without sending anything.</p>
                 <p class="sillynovel-inspector-refusal" role="status" hidden></p>
                 <ul class="sillynovel-inspector-figures" hidden></ul>
